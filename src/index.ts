@@ -30,13 +30,9 @@ async function main() {
   const config = getConfig();
   const mode = isKalshiOnly() ? 'KALSHI-ONLY' : 'BOTH';
   logger.info({ mode: config.TRADING_MODE, platformMode: mode, bankroll: 5000 }, '🐼 PandaXPanther Prediction Bot starting');
-  await sendDiscord(
-    `🐼 Bot online (${config.TRADING_MODE.toUpperCase()} · ${mode})`,
-    isKalshiOnly()
-      ? 'Kalshi-only stack: weather (50%), sum-to-one (20%), nowcast (20%), sports (10%).'
-      : 'Full stack: Polymarket + Kalshi.',
-    'info'
-  );
+  // Note: We DON'T Discord-ping on every boot. Fly may restart the container
+  // and we don't want to spam the channel. Real activity (signals/fills) is
+  // the only thing that should ping.
 
   const kalshi = new KalshiConnector();
   await kalshi.connect().catch((err) => logger.error({ err }, 'Kalshi connect failed'));

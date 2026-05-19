@@ -219,6 +219,48 @@ export class KalshiConnector implements MarketConnector {
     };
   }
 
+  /**
+   * Authenticated orderbook fetch. The public REST /markets endpoint returns
+   * null prices for nearly all markets; only the signed orderbook endpoint
+   * returns real bids/asks.
+   *
+   * Returns: { yesAsk, noAsk } in CENTS (1-99), or null if no data.
+   */
+  async getMarketOrderbook(ticker: string): Promise<{ yesAsk: number | null; noAsk: number | null; yesAskQty: number; noAskQty: number } | null> {
+    if (!this.hasCredentials) return null;
+    try {
+      const headers = this.sign('GET', `/trade-api/v2/markets/${ticker}/orderbook`, Date.now());
+      const { data } = await this.http.get(`/markets/${ticker}/orderbook`, { headers });
+      const ob = data?.orderbook;
+      if (!ob) return null;
+
+      // Kalshi orderbook format:
+      //   { yes: [[price_cents, qty], ...], no: [[price_cents, qty], ...] }
+      // Sorted descending by price (best ask = LOWEST yes_ask = HIGHEST price someone
+      // is willing to BUY YES at, paradoxically. The API returns BIDS not asks.)
+      // Actually Kalshi's convention: "yes" array = YES bids (people buying YES).
+      // For YES ask we look at NO bids (the inverse). This is messy - simpler:
+      //   yes ask  = 100 - max(no_bid)
+      //   no ask   = 100 - max(yes_bid)
+      const yesBids: [number, number][] = ob.yes ?? [];
+      const noBids: [number, number][] = ob.no ?? [];
+      const maxYesBid = yesBids.length > 0 ? Math.max(...yesBids.map((b) => b[0])) : null;
+      const maxNoBid = noBids.length > 0 ? Math.max(...noBids.map((b) => b[0])) : null;
+      const yesAsk = maxNoBid != null ? 100 - maxNoBid : null;
+      const noAsk = maxYesBid != null ? 100 - maxYesBid : null;
+      // Best ask qty = qty at the price level that produced the inverse
+      const yesAskQty = maxNoBid != null ? (noBids.find((b) => b[0] === maxNoBid)?.[1] ?? 0) : 0;
+      const noAskQty = maxYesBid != null ? (yesBids.find((b) => b[0] === maxYesBid)?.[1] ?? 0) : 0;
+
+      return { yesAsk, noAsk, yesAskQty, noAskQty };
+    } catch (err: any) {
+      if (err.response?.status !== 404) {
+        log.debug({ ticker, status: err.response?.status }, 'Orderbook fetch error');
+      }
+      return null;
+    }
+  }
+
   async listActiveMarkets(category?: string): Promise<MarketInfo[]> {
     // Kalshi /markets endpoint is PUBLIC - no auth needed for read
     const params: Record<string, string | number> = { status: 'open', limit: 200 };

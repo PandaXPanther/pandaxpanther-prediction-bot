@@ -88,63 +88,88 @@ export class KalshiSumToOneStrategy {
   }
 
   /**
-   * Scan all open Kalshi markets via REST, parse YES/NO best asks, and
-   * evaluate each for sum-to-one opportunities.
+   * Scan top Kalshi markets and pull authenticated order book data.
+   *
+   * The public /markets endpoint returns null prices on the
+   * api.elections.kalshi.com host. We need to use the authenticated
+   * connector to get real book data. Strategy: discover high-volume
+   * tickers via the public list, then for each one query the
+   * connector's signed orderbook endpoint.
    */
   private async scanMarkets(): Promise<void> {
     try {
       const config = getConfig();
-      // Public endpoint, no auth needed for read
-      const r = await axios.get(`${config.KALSHI_HOST}/markets`, {
-        params: { status: 'open', limit: 500 },
-        timeout: 15000,
-        headers: { 'User-Agent': 'panda-bot' },
-      });
-      const markets = (r.data?.markets ?? []) as any[];
+      // 1) Discover open markets across multiple high-activity series
+      const seriesToScan = [
+        'KXHIGHNY', 'KXHIGHLAX', 'KXHIGHCHI', 'KXHIGHMIA', 'KXHIGHDEN',  // weather
+        'KXNBAGAME', 'KXMLBGAME', 'KXNFLGAME', 'KXNHLGAME',              // sports
+        'KXCPI', 'KXCPIYOY', 'KXJOBS', 'KXFEDDECISION', 'KXGDP',         // macro
+        'KXBTC', 'KXETH',                                                 // crypto
+      ];
       this.intervalScans++;
-
       let parsed = 0;
-      for (const m of markets) {
-        const yesAskCents = m.yes_ask;  // integer cents 1-99, or null
-        const noAskCents = m.no_ask;
-        if (yesAskCents == null || noAskCents == null) continue;
-        if (yesAskCents <= 0 || noAskCents <= 0) continue;
+      let discovered = 0;
 
-        const yesAsk = yesAskCents / 100;
-        const noAsk = noAskCents / 100;
-        parsed++;
+      for (const series of seriesToScan) {
+        try {
+          const r = await axios.get(`${config.KALSHI_HOST}/markets`, {
+            params: { series_ticker: series, status: 'open', limit: 100 },
+            timeout: 10000,
+            headers: { 'User-Agent': 'panda-bot' },
+          });
+          const markets = (r.data?.markets ?? []) as any[];
 
-        // Persist on first sighting
-        let snap = this.snapshots.get(m.ticker);
-        if (!snap) {
-          const marketDbId = await upsertMarket({
-            platform: 'kalshi',
-            external_id: m.ticker,
-            question: m.title ?? m.subtitle ?? m.ticker,
-            category: m.event_ticker?.split('-')[0]?.toLowerCase(),
-            outcome: 'YES',
-            closes_at: m.close_time ? new Date(m.close_time) : undefined,
-            metadata: { event_ticker: m.event_ticker },
-          }) ?? undefined;
-          snap = {
-            ticker: m.ticker,
-            title: m.title ?? m.subtitle ?? m.ticker,
-            yesAsk, noAsk,
-            yesAskQty: m.yes_ask_qty ?? 0,
-            noAskQty: m.no_ask_qty ?? 0,
-            marketDbId,
-          };
-          this.snapshots.set(m.ticker, snap);
-        } else {
-          snap.yesAsk = yesAsk;
-          snap.noAsk = noAsk;
-          snap.yesAskQty = m.yes_ask_qty ?? 0;
-          snap.noAskQty = m.no_ask_qty ?? 0;
+          for (const m of markets.slice(0, 30)) {
+            discovered++;
+            // For each ticker, fetch authenticated orderbook for real prices
+            const book = await this.kalshi.getMarketOrderbook(m.ticker);
+            if (!book) continue;
+
+            const yesAskCents = book.yesAsk;
+            const noAskCents = book.noAsk;
+            if (yesAskCents == null || noAskCents == null) continue;
+            if (yesAskCents <= 0 || noAskCents <= 0) continue;
+
+            const yesAsk = yesAskCents / 100;
+            const noAsk = noAskCents / 100;
+            parsed++;
+
+            let snap = this.snapshots.get(m.ticker);
+            if (!snap) {
+              const marketDbId = await upsertMarket({
+                platform: 'kalshi',
+                external_id: m.ticker,
+                question: m.title ?? m.subtitle ?? m.ticker,
+                category: m.event_ticker?.split('-')[0]?.toLowerCase(),
+                outcome: 'YES',
+                closes_at: m.close_time ? new Date(m.close_time) : undefined,
+                metadata: { event_ticker: m.event_ticker, series_ticker: series },
+              }) ?? undefined;
+              snap = {
+                ticker: m.ticker,
+                title: m.title ?? m.subtitle ?? m.ticker,
+                yesAsk, noAsk,
+                yesAskQty: book.yesAskQty ?? 0,
+                noAskQty: book.noAskQty ?? 0,
+                marketDbId,
+              };
+              this.snapshots.set(m.ticker, snap);
+            } else {
+              snap.yesAsk = yesAsk;
+              snap.noAsk = noAsk;
+              snap.yesAskQty = book.yesAskQty ?? 0;
+              snap.noAskQty = book.noAskQty ?? 0;
+            }
+
+            await this.evaluate(snap);
+          }
+        } catch (err: any) {
+          if (err.response?.status !== 404) {
+            log.debug({ series, status: err.response?.status }, 'Series scan error');
+          }
         }
-
-        await this.evaluate(snap);
       }
-      log.debug({ scanned: markets.length, parsed, snapshots: this.snapshots.size }, 'Kalshi market scan');
+      log.info({ discovered, parsed, snapshots: this.snapshots.size }, 'Kalshi authenticated market scan');
     } catch (err: any) {
       log.error({ err: err.message }, 'Kalshi market scan error');
     }
