@@ -1,5 +1,5 @@
 app = "pandaxpanther-quant"
-primary_region = "den"
+primary_region = "dfw"  # match the main bot region
 
 [build]
   dockerfile = "Dockerfile"

@@ -20,6 +20,9 @@ primary_region = "dfw"  # Dallas - was Denver but Fly deprecated DEN region
   KALSHI_HOST = "https://api.elections.kalshi.com/trade-api/v2"
   KALSHI_WSS = "wss://api.elections.kalshi.com/trade-api/ws/v2"
   NOAA_FORECAST_URL = "https://api.weather.gov"
+  DISCORD_NOTIFY_USER_ID = "572590897150296083"
+  # Point bot at deployed quant service for nowcast + sports models
+  QUANT_SERVICE_URL = "https://pandaxpanther-quant.fly.dev"
 
 [[vm]]
   size = "shared-cpu-1x"

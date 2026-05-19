@@ -84,7 +84,7 @@ export class KalshiSumToOneStrategy {
     }, 60_000);
 
     // Hourly Discord activity ping
-    setInterval(() => this.sendActivityPing(), 60 * 60 * 1000);
+    setInterval(() => this.sendActivityPing(), 15 * 60 * 1000)  // 15 min for permissive paper visibility;
   }
 
   /**

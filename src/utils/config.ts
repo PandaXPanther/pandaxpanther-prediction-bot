@@ -52,6 +52,7 @@ const ConfigSchema = z.object({
 
   // Alerts
   DISCORD_WEBHOOK_URL: z.union([z.string().url(), z.literal('')]).optional(),
+  DISCORD_NOTIFY_USER_ID: z.string().optional(),  // Discord user ID to @mention on trade events
   LOG_LEVEL: z.enum(['trace', 'debug', 'info', 'warn', 'error']).default('info'),
 
   // Quant

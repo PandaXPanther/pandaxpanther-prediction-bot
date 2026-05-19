@@ -34,6 +34,19 @@ from scipy.stats import norm
 
 app = FastAPI(title="PandaXPanther Quant Service")
 
+# ============================================================================
+# Shared HTTP client
+# ============================================================================
+_http_client = httpx.AsyncClient(
+    timeout=20.0,
+    headers={"User-Agent": "pandaxpanther-bot/0.1 (contact: pandaxpanther@gmail.com)"},
+)
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    await _http_client.aclose()
+
 # Station to NOAA grid mapping (lat/lon for 'points' endpoint)
 STATIONS = {
     "KNYC": (40.7128, -74.0060, "New York"),
@@ -221,6 +234,273 @@ async def refresh(station: str):
     _cache_ts.pop((station, "current"), None)
     grid = await fetch_nbm_forecast(station)
     return {"refreshed": station, "updated_at": datetime.utcnow().isoformat()}
+
+
+# ============================================================================
+# ECONOMIC NOWCAST ENDPOINTS
+# ============================================================================
+
+_macro_cache: dict[str, dict] = {}
+_macro_ts: dict[str, datetime] = {}
+MACRO_TTL_MINUTES = 30  # macro data updates daily at most
+
+
+async def _fred_csv(series_id: str) -> list[tuple[str, float]]:
+    """Fetch a FRED series as CSV. Free, no API key required.
+
+    Returns: list of (date_str, value) tuples in chronological order.
+    """
+    cache_key = f"fred:{series_id}"
+    if cache_key in _macro_cache and (datetime.utcnow() - _macro_ts.get(cache_key, datetime.min)).total_seconds() < MACRO_TTL_MINUTES * 60:
+        return _macro_cache[cache_key]["rows"]
+
+    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
+    r = await _http_client.get(url)
+    r.raise_for_status()
+    rows = []
+    for line in r.text.strip().split("\n")[1:]:  # skip header
+        parts = line.split(",")
+        if len(parts) >= 2 and parts[1] not in (".", ""):
+            try:
+                rows.append((parts[0], float(parts[1])))
+            except ValueError:
+                continue
+    _macro_cache[cache_key] = {"rows": rows}
+    _macro_ts[cache_key] = datetime.utcnow()
+    return rows
+
+
+class MacroProbResponse(BaseModel):
+    series: str
+    metric: str
+    threshold: float
+    direction: str
+    prob: float
+    model_estimate: float
+    model_std: float
+    confidence: str  # 'high' | 'medium' | 'low'
+    sources: list[str]
+    notes: str
+
+
+@app.get("/macro/cpi-prob", response_model=MacroProbResponse)
+async def cpi_prob(
+    threshold: float = Query(..., description="YoY CPI % threshold"),
+    direction: str = Query("above", description="above | below"),
+):
+    """Probability that the next CPI YoY print will be above/below threshold.
+
+    Simplified model:
+    - Pull trailing 6 months of CPI YoY changes (CPIAUCSL)
+    - Compute trend + noise band
+    - Probability that next print is above threshold given current trajectory
+    """
+    rows = await _fred_csv("CPIAUCSL")
+    if len(rows) < 13:
+        raise HTTPException(503, "Insufficient CPI history")
+
+    # Compute trailing YoY changes
+    yoy_changes = []
+    for i in range(len(rows) - 1, max(11, len(rows) - 13), -1):
+        cur = rows[i][1]
+        yr_ago = rows[i - 12][1] if i >= 12 else None
+        if yr_ago:
+            yoy_changes.append((rows[i][0], (cur / yr_ago - 1) * 100))
+    if not yoy_changes:
+        raise HTTPException(503, "Cannot compute YoY")
+    yoy_changes.reverse()  # chronological
+
+    # Simple persistence model: next YoY ~ last YoY + trend in last 3 months
+    last_yoy = yoy_changes[-1][1]
+    if len(yoy_changes) >= 3:
+        trend_3mo = (yoy_changes[-1][1] - yoy_changes[-3][1]) / 2  # per-month avg change
+    else:
+        trend_3mo = 0
+
+    model_estimate = last_yoy + trend_3mo
+    # Empirical YoY CPI 1-month standard deviation is around 0.15-0.25 pp
+    model_std = 0.20
+
+    z = (threshold - model_estimate) / model_std
+    prob = 1 - norm.cdf(z) if direction == "above" else norm.cdf(z)
+
+    return MacroProbResponse(
+        series="CPIAUCSL",
+        metric="cpi_yoy_pct",
+        threshold=threshold,
+        direction=direction,
+        prob=round(prob, 5),
+        model_estimate=round(model_estimate, 3),
+        model_std=round(model_std, 3),
+        confidence="medium",  # No real nowcaster wired, just persistence
+        sources=["FRED:CPIAUCSL"],
+        notes="V2-lite model: persistence with 3-month trend. Cleveland Fed nowcaster not yet wired.",
+    )
+
+
+@app.get("/macro/gdp-prob", response_model=MacroProbResponse)
+async def gdp_prob(
+    threshold: float = Query(..., description="Annualized GDP growth % threshold"),
+    direction: str = Query("above", description="above | below"),
+):
+    """Probability that next BEA GDP advance estimate will be above/below threshold,
+    using Atlanta Fed GDPNow as the model.
+    """
+    rows = await _fred_csv("GDPNOW")
+    if not rows:
+        raise HTTPException(503, "No GDPNow data")
+    latest_date, latest_value = rows[-1]
+
+    # GDPNow forecast error std vs actual is documented as ~0.6 pp
+    # (Bognanni & Hotchkiss, FRBA WP 2014-7)
+    model_std = 0.60
+    z = (threshold - latest_value) / model_std
+    prob = 1 - norm.cdf(z) if direction == "above" else norm.cdf(z)
+
+    return MacroProbResponse(
+        series="GDPNOW",
+        metric="gdp_annualized_pct",
+        threshold=threshold,
+        direction=direction,
+        prob=round(prob, 5),
+        model_estimate=round(latest_value, 3),
+        model_std=model_std,
+        confidence="high",  # GDPNow is genuinely good
+        sources=[f"FRED:GDPNOW (latest: {latest_date})"],
+        notes="Atlanta Fed GDPNow nowcast via FRED. Updated 2-3x per week.",
+    )
+
+
+# ============================================================================
+# SPORTS ENDPOINTS — ESPN integration
+# ============================================================================
+
+_espn_cache: dict[tuple, dict] = {}
+_espn_ts: dict[tuple, datetime] = {}
+ESPN_TTL_SECONDS = 60  # ESPN updates win prob every few seconds during games
+
+ESPN_BASE = "http://site.api.espn.com/apis/site/v2/sports"
+LEAGUE_PATHS = {
+    "nba": "basketball/nba",
+    "wnba": "basketball/wnba",
+    "mlb": "baseball/mlb",
+    "nfl": "football/nfl",
+    "nhl": "hockey/nhl",
+}
+
+
+class GameProbResponse(BaseModel):
+    league: str
+    event_id: str
+    home_team: str
+    away_team: str
+    home_score: int
+    away_score: int
+    home_win_prob: float
+    confidence: str
+    state: str  # 'pre' | 'in' | 'post'
+    sources: list[str]
+
+
+@app.get("/sports/games")
+async def list_games(league: str = Query(..., description="nba|wnba|mlb|nfl|nhl")):
+    """List all games today for a league with current state."""
+    if league not in LEAGUE_PATHS:
+        raise HTTPException(400, f"Unsupported league {league}")
+    url = f"{ESPN_BASE}/{LEAGUE_PATHS[league]}/scoreboard"
+    r = await _http_client.get(url)
+    r.raise_for_status()
+    data = r.json()
+    out = []
+    for ev in data.get("events", []):
+        comp = (ev.get("competitions") or [{}])[0]
+        teams = comp.get("competitors", [])
+        home = next((t for t in teams if t.get("homeAway") == "home"), None)
+        away = next((t for t in teams if t.get("homeAway") == "away"), None)
+        if not home or not away:
+            continue
+        out.append({
+            "event_id": ev.get("id"),
+            "name": ev.get("name"),
+            "state": ev.get("status", {}).get("type", {}).get("state"),  # pre|in|post
+            "detail": ev.get("status", {}).get("type", {}).get("detail"),
+            "home": home.get("team", {}).get("abbreviation"),
+            "away": away.get("team", {}).get("abbreviation"),
+            "home_score": int(home.get("score") or 0),
+            "away_score": int(away.get("score") or 0),
+        })
+    return {"league": league, "games": out}
+
+
+@app.get("/sports/win-prob", response_model=GameProbResponse)
+async def win_prob(
+    league: str = Query(...),
+    event_id: str = Query(...),
+):
+    """Get current home-team win probability for a specific game.
+
+    Pre-game: uses ESPN's "Matchup Predictor" model.
+    In-game: uses ESPN's live winprobability stream (updates every play).
+    Post-game: returns 1.0 or 0.0 (resolved).
+    """
+    if league not in LEAGUE_PATHS:
+        raise HTTPException(400, f"Unsupported league {league}")
+
+    cache_key = (league, event_id)
+    if cache_key in _espn_cache and (datetime.utcnow() - _espn_ts.get(cache_key, datetime.min)).total_seconds() < ESPN_TTL_SECONDS:
+        return _espn_cache[cache_key]
+
+    url = f"{ESPN_BASE}/{LEAGUE_PATHS[league]}/summary?event={event_id}"
+    r = await _http_client.get(url)
+    r.raise_for_status()
+    summary = r.json()
+
+    header = summary.get("header", {})
+    competitions = header.get("competitions", [{}])
+    comp = competitions[0] if competitions else {}
+    teams = comp.get("competitors", [])
+    home = next((t for t in teams if t.get("homeAway") == "home"), {})
+    away = next((t for t in teams if t.get("homeAway") == "away"), {})
+    state = comp.get("status", {}).get("type", {}).get("state", "pre")
+
+    home_score = int(home.get("score") or 0)
+    away_score = int(away.get("score") or 0)
+
+    # Pre-game: matchup predictor
+    win_prob_pct = 50.0
+    confidence = "medium"
+    if state == "pre":
+        predictor = summary.get("predictor", {})
+        home_pred = predictor.get("homeTeam", {}).get("gameProjection")
+        if home_pred:
+            win_prob_pct = float(home_pred)
+            confidence = "medium"  # ESPN matchup predictor is reasonable but not great
+    elif state == "in":
+        # Live winprobability is an array; last entry = most recent play
+        wp_arr = summary.get("winprobability", [])
+        if wp_arr:
+            last = wp_arr[-1]
+            win_prob_pct = float(last.get("homeWinPercentage", 0.5)) * 100
+            confidence = "high"  # In-game ESPN WP is quite good
+    elif state == "post":
+        win_prob_pct = 100.0 if home_score > away_score else 0.0
+        confidence = "resolved"
+
+    resp = GameProbResponse(
+        league=league,
+        event_id=event_id,
+        home_team=home.get("team", {}).get("abbreviation", "?"),
+        away_team=away.get("team", {}).get("abbreviation", "?"),
+        home_score=home_score,
+        away_score=away_score,
+        home_win_prob=round(win_prob_pct / 100, 5),
+        confidence=confidence,
+        state=state,
+        sources=[f"ESPN:{league}/summary?event={event_id}"],
+    )
+    _espn_cache[cache_key] = resp.dict()
+    _espn_ts[cache_key] = datetime.utcnow()
+    return resp
 
 
 if __name__ == "__main__":

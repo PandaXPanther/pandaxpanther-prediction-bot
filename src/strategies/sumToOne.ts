@@ -95,7 +95,7 @@ export class SumToOneStrategy {
     }, 60_000);
 
     // Hourly "liveness" Discord ping with the tightest spread we saw this hour
-    setInterval(() => this.sendActivityPing(), 60 * 60 * 1000);
+    setInterval(() => this.sendActivityPing(), 15 * 60 * 1000)  // 15 min for permissive paper visibility;
   }
 
   /**
