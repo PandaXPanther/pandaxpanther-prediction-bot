@@ -163,27 +163,66 @@ export class CrossPlatformStrategy {
 
       for (const m of pmMarkets) {
         const lc = m.question.toLowerCase();
-        if (!lc.includes('highest temperature in')) continue;
+        if (!lc.includes('highest temperature in') && !lc.includes('high temp in')) continue;
         if (!m.yes_token || !m.no_token) continue;
 
-        // Match patterns like "in NYC be between 89-90°F on May 20"
+        // Three Polymarket question formats we handle:
+        //   1. "...in NYC be between 89-90°F on May 20"
+        //   2. "...in NYC be 89°F or higher on May 20"     (= Kalshi T<n>, n=88)
+        //   3. "...in NYC be above 96°F on May 20"          (= Kalshi T<n>, n=96)
+        //   4. "...in NYC be below 89°F on May 20"          (= Kalshi T<n-1> NO side)
         const rng = m.question.match(/in ([\w ]+?) be between (\d+)-(\d+).F on (\w+) (\d+)/i);
-        if (!rng) continue;
-        const city = rng[1].trim();
-        const lo = parseInt(rng[2], 10);
-        const hi = parseInt(rng[3], 10);
-        const monthRaw = rng[4];
-        const day = parseInt(rng[5], 10);
+        const higher = m.question.match(/in ([\w ]+?) be (\d+).F or higher on (\w+) (\d+)/i);
+        const above = m.question.match(/in ([\w ]+?) be above (\d+).F on (\w+) (\d+)/i);
+        const below = m.question.match(/in ([\w ]+?) be below (\d+).F on (\w+) (\d+)/i);
+
+        let city: string | null = null;
+        let monthRaw = '';
+        let day = 0;
+        let kalshiSuffix = '';
+        let description = '';
+        if (rng) {
+          city = rng[1].trim();
+          const lo = parseInt(rng[2], 10);
+          const hi = parseInt(rng[3], 10);
+          monthRaw = rng[4];
+          day = parseInt(rng[5], 10);
+          const midpoint = (lo + hi) / 2;
+          kalshiSuffix = `B${midpoint % 1 === 0 ? midpoint : midpoint.toFixed(1)}`;
+          description = `${city} ${lo}-${hi}°F on ${monthRaw} ${day}`;
+        } else if (higher) {
+          city = higher[1].trim();
+          const thr = parseInt(higher[2], 10);
+          monthRaw = higher[3];
+          day = parseInt(higher[4], 10);
+          // "X°F or higher" = T(X-1) on Kalshi (T<n> means ">n")
+          kalshiSuffix = `T${thr - 1}`;
+          description = `${city} ≥${thr}°F on ${monthRaw} ${day}`;
+        } else if (above) {
+          city = above[1].trim();
+          const thr = parseInt(above[2], 10);
+          monthRaw = above[3];
+          day = parseInt(above[4], 10);
+          kalshiSuffix = `T${thr}`;
+          description = `${city} >${thr}°F on ${monthRaw} ${day}`;
+        } else if (below) {
+          city = below[1].trim();
+          const thr = parseInt(below[2], 10);
+          monthRaw = below[3];
+          day = parseInt(below[4], 10);
+          kalshiSuffix = `T${thr}`;  // Kalshi T<n>=">n", so YES on Kalshi = NO on PM
+          description = `${city} <${thr}°F on ${monthRaw} ${day}`;
+        } else {
+          continue;
+        }
 
         const series = KALSHI_WEATHER_SERIES[city];
         if (!series) continue;
         const monthShort = MONTH_ABBR[monthRaw];
         if (!monthShort) continue;
 
-        // Build Kalshi ticker - bucket markets use midpoint
-        const midpoint = (lo + hi) / 2;
         const year = new Date().getFullYear() % 100;
-        const ticker = `${series}-${year}${monthShort}${String(day).padStart(2, '0')}-B${midpoint % 1 === 0 ? midpoint : midpoint.toFixed(1)}`;
+        const ticker = `${series}-${year}${monthShort}${String(day).padStart(2, '0')}-${kalshiSuffix}`;
         discovered++;
 
         // Verify the Kalshi ticker exists
@@ -193,8 +232,8 @@ export class CrossPlatformStrategy {
           if (!r.data?.market) continue;
           verified++;
           await this.registerPair({
-            id: `weather-${city.toLowerCase().replace(/\s+/g, '-')}-${lo}-${hi}-${monthShort}-${day}`,
-            description: `${city} ${lo}-${hi}°F on ${monthRaw} ${day}`,
+            id: `weather-${city.toLowerCase().replace(/\s+/g, '-')}-${kalshiSuffix}-${monthShort}-${day}`,
+            description,
             kalshiTicker: ticker,
             polymarketYesToken: m.yes_token,
             polymarketNoToken: m.no_token,

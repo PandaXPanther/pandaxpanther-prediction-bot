@@ -1,5 +1,5 @@
 app = "pandaxpanther-prediction-bot"
-primary_region = "den"
+primary_region = "dfw"  # Dallas - was Denver but Fly deprecated DEN region
 
 [build]
   dockerfile = "Dockerfile"
@@ -16,6 +16,7 @@ primary_region = "den"
   KALSHI_HOST = "https://api.elections.kalshi.com/trade-api/v2"
   KALSHI_WSS = "wss://api.elections.kalshi.com/trade-api/ws/v2"
   BINANCE_WS_URL = "wss://stream.binance.com:9443/ws"
+  BINANCE_DISABLED = "true"  # Fly IPs are geo-blocked by Binance; Coinbase covers
   COINBASE_WS_URL = "wss://ws-feed.exchange.coinbase.com"
   NOAA_FORECAST_URL = "https://api.weather.gov"
 

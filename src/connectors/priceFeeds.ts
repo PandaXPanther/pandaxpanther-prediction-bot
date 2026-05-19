@@ -29,8 +29,21 @@ export class PriceFeedAggregator {
   // Symbols to track (in Binance format)
   private symbols = ['btcusdt', 'ethusdt', 'solusdt'];
 
+  // Allow operators to disable Binance via env (e.g. when running from a region
+  // where Binance HTTP 451 geo-blocks us, like most Fly.io IPs)
+  private binanceEnabled = process.env.BINANCE_DISABLED !== 'true';
+
   async start(): Promise<void> {
-    await Promise.all([this.connectBinance(), this.connectCoinbase()]);
+    const tasks: Promise<void>[] = [this.connectCoinbase()];
+    if (this.binanceEnabled) {
+      tasks.push(this.connectBinance().catch((err) => {
+        log.warn({ err }, 'Binance connect failed - disabling for this session');
+        this.binanceEnabled = false;
+      }));
+    } else {
+      log.info('Binance disabled via BINANCE_DISABLED=true');
+    }
+    await Promise.all(tasks);
   }
 
   private async connectBinance(): Promise<void> {
@@ -55,10 +68,19 @@ export class PriceFeedAggregator {
         log.debug({ err }, 'Binance parse error');
       }
     });
-    this.binanceWs.on('error', (err) => log.error({ err }, 'Binance WS error'));
+
     this.binanceWs.on('close', () => {
-      log.warn('Binance WS closed - reconnecting in 5s');
-      setTimeout(() => this.connectBinance(), 5000);
+      if (!this.binanceEnabled) return;
+      log.warn('Binance WS closed - reconnecting in 30s');
+      setTimeout(() => this.connectBinance(), 30_000);
+    });
+    this.binanceWs.on('error', (err: any) => {
+      // HTTP 451 = geo-blocked. Stop retrying.
+      if (String(err.message).includes('451')) {
+        log.warn('Binance returned HTTP 451 (geo-blocked) - disabling permanently, Coinbase will cover');
+        this.binanceEnabled = false;
+        try { this.binanceWs?.close(); } catch {}
+      }
     });
   }
 
