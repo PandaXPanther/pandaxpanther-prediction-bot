@@ -24,14 +24,23 @@ import { PolymarketConnector } from '../connectors/polymarket.js';
 import { getRiskEngine } from '../risk/riskEngine.js';
 import { createStrategyLogger } from '../utils/logger.js';
 import { sendDiscord } from '../utils/discord.js';
+import { isPermissive, getConfig } from '../utils/config.js';
+import { upsertMarket, recordSignal, recordOrder, recordHeartbeat } from '../db/supabase.js';
 import type { OrderBook } from '../connectors/types.js';
 
 const log = createStrategyLogger('sum_to_one');
 
-// Trigger threshold: combined best ask must be at or below this for a trade
-const TRIGGER_SUM = 0.97;  // 3% gross edge minimum
+// Production thresholds: tight, only fire on real edge
+const TRIGGER_SUM_PROD = 0.97;          // 3% gross edge minimum
+const MIN_EDGE_AFTER_FEES_PROD = 0.015; // 1.5% minimum net edge
+// Permissive thresholds for accelerated paper-trading discovery
+const TRIGGER_SUM_PERMISSIVE = 0.995;          // 0.5% gross edge
+const MIN_EDGE_AFTER_FEES_PERMISSIVE = 0.002;  // 0.2% net edge
+
 const TAKER_FEE_BPS = 0;   // Polymarket sports/event taker fees vary; calibrate from live data
-const MIN_EDGE_AFTER_FEES = 0.015; // 1.5% minimum net edge
+
+const getTriggerSum = () => (isPermissive() ? TRIGGER_SUM_PERMISSIVE : TRIGGER_SUM_PROD);
+const getMinEdge = () => (isPermissive() ? MIN_EDGE_AFTER_FEES_PERMISSIVE : MIN_EDGE_AFTER_FEES_PROD);
 
 interface MarketPair {
   conditionId: string;
@@ -40,6 +49,9 @@ interface MarketPair {
   question: string;
   yesBook?: OrderBook;
   noBook?: OrderBook;
+  yesMarketDbId?: string;   // Supabase markets.id
+  noMarketDbId?: string;
+  closesAt?: Date;
 }
 
 export class SumToOneStrategy {
@@ -56,7 +68,7 @@ export class SumToOneStrategy {
     await this.discoverAndSubscribe();
     setInterval(() => this.discoverAndSubscribe(), 15 * 60 * 1000); // refresh every 15 min
 
-    // Periodic visibility into how alive the strategy is
+    // Periodic visibility into how alive the strategy is + persist heartbeat
     setInterval(() => {
       const pairsWithBooks = [...this.pairs.values()].filter(
         (p) => p.yesBook?.bestAsk || p.noBook?.bestAsk
@@ -64,16 +76,17 @@ export class SumToOneStrategy {
       const pairsWithBothSides = [...this.pairs.values()].filter(
         (p) => p.yesBook?.bestAsk && p.noBook?.bestAsk
       ).length;
-      log.info({
+      const payload = {
         totalPairs: this.pairs.size,
         pairsWithAnyBook: pairsWithBooks,
         pairsWithBothSides,
         bookUpdates: this.bookUpdateCount,
         opportunitiesAboveThreshold: this.opportunitiesSeen,
-        bestSumSeen: this.bestSumSeen.toFixed(4),
-        bestMarket: this.bestSumQuestion.slice(0, 60),
-      }, '📊 sum_to_one heartbeat');
-    }, 30_000);
+        bestSumSeen: Number(this.bestSumSeen.toFixed(4)),
+        bestMarket: this.bestSumQuestion.slice(0, 100),
+      };
+      void recordHeartbeat('sum_to_one', getConfig().TRADING_MODE, payload);
+    }, 60_000);
   }
 
   private async discoverAndSubscribe(): Promise<void> {
@@ -93,8 +106,27 @@ export class SumToOneStrategy {
         yesToken: m.yes_token!,
         noToken: m.no_token!,
         question: m.question,
+        closesAt: m.closesAt,
       };
       this.pairs.set(m.externalId, pair);
+
+      // Persist both market sides to Supabase
+      pair.yesMarketDbId = await upsertMarket({
+        platform: 'polymarket',
+        external_id: m.yes_token!,
+        question: m.question,
+        outcome: 'YES',
+        closes_at: m.closesAt,
+        metadata: { conditionId: m.externalId },
+      }) ?? undefined;
+      pair.noMarketDbId = await upsertMarket({
+        platform: 'polymarket',
+        external_id: m.no_token!,
+        question: m.question,
+        outcome: 'NO',
+        closes_at: m.closesAt,
+        metadata: { conditionId: m.externalId },
+      }) ?? undefined;
 
       await this.polymarket.subscribeOrderBook(m.yes_token!, (book) => {
         pair.yesBook = book;
@@ -127,7 +159,7 @@ export class SumToOneStrategy {
       this.bestSumQuestion = pair.question;
     }
 
-    if (sum >= TRIGGER_SUM) return;
+    if (sum >= getTriggerSum()) return;
 
     this.opportunitiesSeen++;
 
@@ -135,7 +167,21 @@ export class SumToOneStrategy {
     const grossEdge = 1.0 - sum;
     const fees = (TAKER_FEE_BPS / 10000) * 2; // both sides
     const netEdge = grossEdge - fees;
-    if (netEdge < MIN_EDGE_AFTER_FEES) return;
+
+    // Record EVERY opportunity (acted or not) for backtest / analysis
+    const signalId = await recordSignal({
+      strategy: 'sum_to_one',
+      market_id: pair.yesMarketDbId,
+      cross_market_id: pair.noMarketDbId,
+      edge_bps: Math.round(grossEdge * 10000),
+      market_prob: yesAsk,
+      recommended_size_usd: Math.min(pair.yesBook.bestAsk.size, pair.noBook.bestAsk.size) * Math.max(yesAsk, noAsk),
+      side: 'ARB_BUY_BOTH',
+      reason: netEdge < getMinEdge() ? 'below_min_edge' : 'actionable',
+      payload: { yesAsk, noAsk, sum, grossEdge, netEdge, question: pair.question },
+    });
+
+    if (netEdge < getMinEdge()) return;
 
     // Determine size = min(yes ask depth, no ask depth)
     const maxSize = Math.min(pair.yesBook.bestAsk.size, pair.noBook.bestAsk.size);
@@ -178,6 +224,39 @@ export class SumToOneStrategy {
           size: sizeToTrade,
         }),
       ]);
+
+      const mode = getConfig().TRADING_MODE;
+      // Persist both orders
+      void recordOrder({
+        signal_id: signalId ?? undefined,
+        market_id: pair.yesMarketDbId,
+        strategy: 'sum_to_one',
+        mode,
+        side: 'BUY',
+        order_type: 'FOK',
+        price: yesAsk,
+        size: sizeToTrade,
+        outcome: 'YES',
+        external_order_id: yesResult.externalOrderId,
+        status: (yesResult.filled ?? 0) > 0 ? 'filled' : 'rejected',
+        filled_size: yesResult.filled ?? 0,
+        avg_fill_price: yesResult.avgPrice,
+      });
+      void recordOrder({
+        signal_id: signalId ?? undefined,
+        market_id: pair.noMarketDbId,
+        strategy: 'sum_to_one',
+        mode,
+        side: 'BUY',
+        order_type: 'FOK',
+        price: noAsk,
+        size: sizeToTrade,
+        outcome: 'NO',
+        external_order_id: noResult.externalOrderId,
+        status: (noResult.filled ?? 0) > 0 ? 'filled' : 'rejected',
+        filled_size: noResult.filled ?? 0,
+        avg_fill_price: noResult.avgPrice,
+      });
 
       const yesFilled = yesResult.ok && (yesResult.filled ?? 0) > 0;
       const noFilled = noResult.ok && (noResult.filled ?? 0) > 0;

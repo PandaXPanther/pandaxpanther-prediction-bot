@@ -31,11 +31,14 @@ import { KalshiConnector } from '../connectors/kalshi.js';
 import { getRiskEngine } from '../risk/riskEngine.js';
 import { createStrategyLogger } from '../utils/logger.js';
 import { sendDiscord } from '../utils/discord.js';
+import { isPermissive } from '../utils/config.js';
 import type { OrderBook } from '../connectors/types.js';
 
 const log = createStrategyLogger('cross_platform');
 
-const MIN_EDGE_AFTER_FEES = 0.02; // 2% minimum
+const MIN_EDGE_PROD = 0.02;        // 2% minimum in production
+const MIN_EDGE_PERMISSIVE = 0.003; // 0.3% minimum in permissive paper
+const getMinEdge = () => (isPermissive() ? MIN_EDGE_PERMISSIVE : MIN_EDGE_PROD);
 const FOK_TIMEOUT_MS = 800;
 
 interface CrossPair {
@@ -119,12 +122,13 @@ export class CrossPlatformStrategy {
     const kNoAsk = 1 - kYesBid;
     const sumB = kNoAsk + pYes;
 
+    const minEdge = getMinEdge();
     let path: 'A' | 'B' | null = null;
     let edge = 0;
-    if (sumA < 1 - MIN_EDGE_AFTER_FEES) {
+    if (sumA < 1 - minEdge) {
       path = 'A';
       edge = 1 - sumA;
-    } else if (sumB < 1 - MIN_EDGE_AFTER_FEES) {
+    } else if (sumB < 1 - minEdge) {
       path = 'B';
       edge = 1 - sumB;
     }

@@ -9,6 +9,7 @@ for (const k of Object.keys(process.env)) {
 const ConfigSchema = z.object({
   // Mode
   TRADING_MODE: z.enum(['paper', 'live']).default('paper'),
+  PERMISSIVE_PAPER: z.coerce.boolean().default(false),
   DAILY_LOSS_CAP_USD: z.coerce.number().positive().default(200),
   MAX_POSITION_PER_MARKET_USD: z.coerce.number().positive().default(250),
 
@@ -67,4 +68,16 @@ export function getConfig(): Config {
 
 export function isPaperMode(): boolean {
   return getConfig().TRADING_MODE === 'paper';
+}
+
+/**
+ * Is permissive paper mode on?
+ * - Forces FALSE if we're in live mode (safety guard, even if user accidentally
+ *   set PERMISSIVE_PAPER=true while flipping to live)
+ * - Used by strategies to drop signal thresholds for accelerated discovery
+ */
+export function isPermissive(): boolean {
+  const c = getConfig();
+  if (c.TRADING_MODE === 'live') return false;
+  return c.PERMISSIVE_PAPER;
 }

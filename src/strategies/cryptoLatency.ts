@@ -30,11 +30,14 @@ import { PriceFeedAggregator } from '../connectors/priceFeeds.js';
 import { getRiskEngine } from '../risk/riskEngine.js';
 import { createStrategyLogger } from '../utils/logger.js';
 import { sendDiscord } from '../utils/discord.js';
+import { isPermissive } from '../utils/config.js';
 import type { OrderBook } from '../connectors/types.js';
 
 const log = createStrategyLogger('crypto_latency');
 
-const MIN_PROB_DIVERGENCE = 0.06; // 6 percentage points - quite strict, raises bar
+const MIN_PROB_DIVERGENCE_PROD = 0.06;        // 6pp in production
+const MIN_PROB_DIVERGENCE_PERMISSIVE = 0.02;  // 2pp in permissive paper
+const getMinDivergence = () => (isPermissive() ? MIN_PROB_DIVERGENCE_PERMISSIVE : MIN_PROB_DIVERGENCE_PROD);
 const RECENT_VOL_WINDOW_MS = 5 * 60 * 1000; // 5 minutes of price history
 
 interface CryptoMarket {
@@ -250,7 +253,7 @@ export class CryptoLatencyStrategy {
     const marketMid = (market.yesBook.bestBid.price + market.yesBook.bestAsk.price) / 2;
 
     const divergence = modelProb - marketMid;
-    if (Math.abs(divergence) < MIN_PROB_DIVERGENCE) return;
+    if (Math.abs(divergence) < getMinDivergence()) return;
 
     const risk = getRiskEngine();
     let side: 'YES' | 'NO';

@@ -32,12 +32,14 @@ import { KalshiConnector } from '../connectors/kalshi.js';
 import { getRiskEngine } from '../risk/riskEngine.js';
 import { createStrategyLogger } from '../utils/logger.js';
 import { sendDiscord } from '../utils/discord.js';
-import { getConfig } from '../utils/config.js';
+import { getConfig, isPermissive } from '../utils/config.js';
 import type { OrderBook } from '../connectors/types.js';
 
 const log = createStrategyLogger('weather');
 
-const MIN_PROB_DIVERGENCE = 0.08; // 8 percentage points
+const MIN_PROB_DIVERGENCE_PROD = 0.08;       // 8pp in production
+const MIN_PROB_DIVERGENCE_PERMISSIVE = 0.03; // 3pp in permissive paper
+const getMinDivergence = () => (isPermissive() ? MIN_PROB_DIVERGENCE_PERMISSIVE : MIN_PROB_DIVERGENCE_PROD);
 const POLL_INTERVAL_MS = 5 * 60 * 1000; // re-evaluate every 5 minutes
 
 interface WeatherContract {
@@ -206,7 +208,7 @@ export class WeatherStrategy {
 
     const marketMid = (c.book.bestBid.price + c.book.bestAsk.price) / 2;
     const divergence = modelProb - marketMid;
-    if (Math.abs(divergence) < MIN_PROB_DIVERGENCE) return;
+    if (Math.abs(divergence) < getMinDivergence()) return;
 
     const risk = getRiskEngine();
     const side: 'YES' | 'NO' = divergence > 0 ? 'YES' : 'NO';
