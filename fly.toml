@@ -1,5 +1,5 @@
 app = "pandaxpanther-prediction-bot"
-primary_region = "den"  # Denver — close to you
+primary_region = "den"
 
 [build]
   dockerfile = "Dockerfile"
@@ -7,19 +7,20 @@ primary_region = "den"  # Denver — close to you
 [env]
   NODE_ENV = "production"
   LOG_LEVEL = "info"
-  TRADING_MODE = "paper"  # Override via `fly secrets set TRADING_MODE=live` when ready
+  TRADING_MODE = "paper"
+  PERMISSIVE_PAPER = "true"
+  DAILY_LOSS_CAP_USD = "200"
+  MAX_POSITION_PER_MARKET_USD = "250"
+  POLYMARKET_HOST = "https://clob.polymarket.com"
+  POLYMARKET_CHAIN_ID = "137"
+  KALSHI_HOST = "https://api.elections.kalshi.com/trade-api/v2"
+  KALSHI_WSS = "wss://api.elections.kalshi.com/trade-api/ws/v2"
+  BINANCE_WS_URL = "wss://stream.binance.com:9443/ws"
+  COINBASE_WS_URL = "wss://ws-feed.exchange.coinbase.com"
+  NOAA_FORECAST_URL = "https://api.weather.gov"
 
 [[vm]]
   size = "shared-cpu-1x"
   memory = "512mb"
 
-# No public HTTP service — pure background worker
-[processes]
-  bot = "node dist/index.js"
-
-[checks.alive]
-  type = "tcp"
-  port = 8080
-  interval = "30s"
-  timeout = "5s"
-  grace_period = "60s"
+# Pure background worker - no HTTP service exposed publicly

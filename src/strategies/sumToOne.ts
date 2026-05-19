@@ -60,6 +60,12 @@ export class SumToOneStrategy {
   private opportunitiesSeen = 0;
   private bestSumSeen = 2;          // running minimum of (yesAsk + noAsk)
   private bestSumQuestion = '';
+  // Rolling tightest-sum tracker reset on each Discord ping interval
+  private intervalBestSum = 2;
+  private intervalBestQuestion = '';
+  private intervalBestYesAsk = 0;
+  private intervalBestNoAsk = 0;
+  private intervalBookUpdates = 0;
 
   constructor(private polymarket: PolymarketConnector) {}
 
@@ -87,6 +93,45 @@ export class SumToOneStrategy {
       };
       void recordHeartbeat('sum_to_one', getConfig().TRADING_MODE, payload);
     }, 60_000);
+
+    // Hourly "liveness" Discord ping with the tightest spread we saw this hour
+    setInterval(() => this.sendActivityPing(), 60 * 60 * 1000);
+  }
+
+  /**
+   * Periodic Discord ping showing the bot is alive and what the markets
+   * looked like in the past interval. Helps you see activity even when
+   * nothing's actionable.
+   */
+  private async sendActivityPing(): Promise<void> {
+    const pairsWithBoth = [...this.pairs.values()].filter(
+      (p) => p.yesBook?.bestAsk && p.noBook?.bestAsk
+    ).length;
+    const overspread = this.intervalBestSum - 1.0;
+    const label = overspread <= 0
+      ? `🟢 ARB! ${(-overspread * 100).toFixed(2)}% under fair`
+      : `⚪ Tightest seen: ${(overspread * 100).toFixed(2)}% over fair`;
+
+    await sendDiscord(
+      '📊 Sum-to-one hourly report',
+      `Monitoring **${this.pairs.size} markets** (${pairsWithBoth} with both sides live).\n\n${label}`,
+      overspread <= 0 ? 'success' : 'info',
+      [
+        { name: 'Tightest market', value: this.intervalBestQuestion.slice(0, 120) || 'none yet', inline: false },
+        { name: 'YES ask', value: this.intervalBestYesAsk ? this.intervalBestYesAsk.toFixed(4) : '-', inline: true },
+        { name: 'NO ask', value: this.intervalBestNoAsk ? this.intervalBestNoAsk.toFixed(4) : '-', inline: true },
+        { name: 'Sum', value: this.intervalBestSum.toFixed(4), inline: true },
+        { name: 'Book updates / hr', value: this.intervalBookUpdates.toLocaleString(), inline: true },
+        { name: 'Mode', value: getConfig().TRADING_MODE.toUpperCase(), inline: true },
+      ]
+    );
+
+    // Reset interval trackers
+    this.intervalBestSum = 2;
+    this.intervalBestQuestion = '';
+    this.intervalBestYesAsk = 0;
+    this.intervalBestNoAsk = 0;
+    this.intervalBookUpdates = 0;
   }
 
   private async discoverAndSubscribe(): Promise<void> {
@@ -158,6 +203,13 @@ export class SumToOneStrategy {
       this.bestSumSeen = sum;
       this.bestSumQuestion = pair.question;
     }
+    if (sum < this.intervalBestSum) {
+      this.intervalBestSum = sum;
+      this.intervalBestQuestion = pair.question;
+      this.intervalBestYesAsk = yesAsk;
+      this.intervalBestNoAsk = noAsk;
+    }
+    this.intervalBookUpdates++;
 
     if (sum >= getTriggerSum()) return;
 

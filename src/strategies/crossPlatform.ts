@@ -26,6 +26,7 @@
  *     should add LLM-powered semantic matching across the full market list.
  */
 
+import axios from 'axios';
 import { PolymarketConnector } from '../connectors/polymarket.js';
 import { KalshiConnector } from '../connectors/kalshi.js';
 import { getRiskEngine } from '../risk/riskEngine.js';
@@ -53,21 +54,47 @@ interface CrossPair {
 }
 
 /**
- * V1 manual pair registry.
- * Add pairs here that you've manually verified resolve identically.
+ * V1 manual pair registry. Use this for any pairs where you've manually
+ * verified identical resolution criteria.
  *
- * Future: auto-discover via LLM matching of questions.
+ * The auto-discovery routine below ALSO populates pairs at runtime by
+ * matching Polymarket weather contracts to Kalshi tickers via a known
+ * city/threshold convention. That's far more reliable than hand-curating
+ * because tomorrow's contracts get listed daily.
  */
 const PAIRS: Omit<CrossPair, 'kalshiBook' | 'polyYesBook' | 'polyNoBook'>[] = [
-  // Example structure - populate with real tickers once accounts are live:
-  // {
-  //   id: 'fed-rate-june-2026',
-  //   description: 'Fed cuts rates in June 2026',
-  //   kalshiTicker: 'FED-26JUN-CUT',
-  //   polymarketYesToken: '0x...',
-  //   polymarketNoToken: '0x...',
-  // },
+  // Manual high-confidence pairs go here. None at present - all current
+  // pairs come from auto-discovery.
 ];
+
+// Polymarket city name -> Kalshi series ticker prefix
+// Verified by querying https://api.elections.kalshi.com/trade-api/v2/series
+const KALSHI_WEATHER_SERIES: Record<string, string> = {
+  'NYC': 'KXHIGHNY',
+  'New York': 'KXHIGHNY',
+  'Chicago': 'KXHIGHCHI',
+  'LA': 'KXHIGHLAX',
+  'Los Angeles': 'KXHIGHLAX',
+  'Miami': 'KXHIGHMIA',
+  'Denver': 'KXHIGHDEN',
+  'Seattle': 'KXHIGHTSEA',
+  'Phoenix': 'KXHIGHTPHX',
+  'San Francisco': 'KXHIGHTSFO',
+  'Houston': 'KXHIGHHOU',
+  'Atlanta': 'KXHIGHATL',
+  'Boston': 'KXHIGHBOS',
+  'Philadelphia': 'KXHIGHPHI',
+  'Austin': 'KXHIGHAUS',
+};
+
+const MONTH_ABBR: Record<string, string> = {
+  Jan: 'JAN', Feb: 'FEB', Mar: 'MAR', Apr: 'APR',
+  May: 'MAY', Jun: 'JUN', Jul: 'JUL', Aug: 'AUG',
+  Sep: 'SEP', Oct: 'OCT', Nov: 'NOV', Dec: 'DEC',
+  January: 'JAN', February: 'FEB', March: 'MAR', April: 'APR',
+  June: 'JUN', July: 'JUL', August: 'AUG',
+  September: 'SEP', October: 'OCT', November: 'NOV', December: 'DEC',
+};
 
 export class CrossPlatformStrategy {
   private pairs = new Map<string, CrossPair>();
@@ -81,15 +108,24 @@ export class CrossPlatformStrategy {
   async start(): Promise<void> {
     log.info({ count: PAIRS.length }, 'Cross-platform strategy starting');
 
-    if (PAIRS.length === 0) {
-      log.warn('No pairs registered yet. Add to PAIRS in crossPlatform.ts');
-      return;
+    // Manual pairs first
+    for (const p of PAIRS) {
+      await this.registerPair({ ...p });
     }
 
-    for (const p of PAIRS) {
-      const pair: CrossPair = { ...p };
-      this.pairs.set(p.id, pair);
+    // Auto-discover weather pairs (Polymarket weather contracts that have
+    // matching Kalshi tickers)
+    await this.discoverWeatherPairs();
+    // Refresh daily - new contracts list each day
+    setInterval(() => this.discoverWeatherPairs(), 6 * 60 * 60 * 1000);
+  }
 
+  private async registerPair(p: Omit<CrossPair, 'kalshiBook' | 'polyYesBook' | 'polyNoBook'>): Promise<void> {
+    if (this.pairs.has(p.id)) return;
+    const pair: CrossPair = { ...p };
+    this.pairs.set(p.id, pair);
+
+    try {
       await this.kalshi.subscribeOrderBook(p.kalshiTicker, (book) => {
         pair.kalshiBook = book;
         this.checkArbitrage(pair);
@@ -102,6 +138,90 @@ export class CrossPlatformStrategy {
         pair.polyNoBook = book;
         this.checkArbitrage(pair);
       });
+      log.info({ id: p.id, description: p.description }, 'Cross-platform pair registered');
+    } catch (err) {
+      log.error({ err, pair: p.id }, 'Failed to register pair');
+    }
+  }
+
+  /**
+   * Auto-discover weather pairs.
+   *
+   * Polymarket lists weather questions like:
+   *   "Will the highest temperature in NYC be between 89-90°F on May 20?"
+   * Kalshi lists the same as ticker:
+   *   KXHIGHNY-26MAY20-B89.5  (B = bucket, midpoint of range)
+   *
+   * We pull all Polymarket weather contracts, parse them, and verify each
+   * matching Kalshi ticker exists via the public /markets endpoint.
+   */
+  private async discoverWeatherPairs(): Promise<void> {
+    try {
+      const pmMarkets = await this.polymarket.listActiveMarkets();
+      let discovered = 0;
+      let verified = 0;
+
+      for (const m of pmMarkets) {
+        const lc = m.question.toLowerCase();
+        if (!lc.includes('highest temperature in')) continue;
+        if (!m.yes_token || !m.no_token) continue;
+
+        // Match patterns like "in NYC be between 89-90°F on May 20"
+        const rng = m.question.match(/in ([\w ]+?) be between (\d+)-(\d+).F on (\w+) (\d+)/i);
+        if (!rng) continue;
+        const city = rng[1].trim();
+        const lo = parseInt(rng[2], 10);
+        const hi = parseInt(rng[3], 10);
+        const monthRaw = rng[4];
+        const day = parseInt(rng[5], 10);
+
+        const series = KALSHI_WEATHER_SERIES[city];
+        if (!series) continue;
+        const monthShort = MONTH_ABBR[monthRaw];
+        if (!monthShort) continue;
+
+        // Build Kalshi ticker - bucket markets use midpoint
+        const midpoint = (lo + hi) / 2;
+        const year = new Date().getFullYear() % 100;
+        const ticker = `${series}-${year}${monthShort}${String(day).padStart(2, '0')}-B${midpoint % 1 === 0 ? midpoint : midpoint.toFixed(1)}`;
+        discovered++;
+
+        // Verify the Kalshi ticker exists
+        try {
+          const url = `${process.env.KALSHI_HOST ?? 'https://api.elections.kalshi.com/trade-api/v2'}/markets/${ticker}`;
+          const r = await axios.get(url, { timeout: 5000, headers: { 'User-Agent': 'panda-bot' } });
+          if (!r.data?.market) continue;
+          verified++;
+          await this.registerPair({
+            id: `weather-${city.toLowerCase().replace(/\s+/g, '-')}-${lo}-${hi}-${monthShort}-${day}`,
+            description: `${city} ${lo}-${hi}°F on ${monthRaw} ${day}`,
+            kalshiTicker: ticker,
+            polymarketYesToken: m.yes_token,
+            polymarketNoToken: m.no_token,
+          });
+        } catch {
+          // Kalshi ticker doesn't exist - skip silently
+        }
+      }
+
+      log.info(
+        { discovered, verified, totalPairs: this.pairs.size },
+        'Weather pair auto-discovery complete'
+      );
+      if (verified > 0) {
+        await sendDiscord(
+          '🌤️ Cross-platform pairs activated',
+          `Auto-discovered **${verified} matching weather contracts** across Kalshi and Polymarket.`,
+          'success',
+          [
+            { name: 'Polymarket weather questions found', value: discovered.toString(), inline: true },
+            { name: 'Kalshi tickers verified', value: verified.toString(), inline: true },
+            { name: 'Total cross-platform pairs', value: this.pairs.size.toString(), inline: true },
+          ]
+        );
+      }
+    } catch (err) {
+      log.error({ err }, 'Weather pair discovery error');
     }
   }
 
