@@ -38,6 +38,7 @@ const ConfigSchema = z.object({
 
   // Kalshi
   KALSHI_API_KEY_ID: z.string().optional(),
+  KALSHI_PRIVATE_KEY: z.string().optional(),  // RSA PEM content (Fly secrets pattern)
   KALSHI_PRIVATE_KEY_PATH: z.string().default('./secrets/kalshi_private_key.pem'),
   KALSHI_HOST: z.string().url().default('https://api.elections.kalshi.com/trade-api/v2'),
   KALSHI_WSS: z.string().default('wss://api.elections.kalshi.com/trade-api/ws/v2'),

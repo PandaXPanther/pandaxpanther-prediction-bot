@@ -47,17 +47,25 @@ export class KalshiConnector implements MarketConnector {
 
   async connect(): Promise<void> {
     const config = getConfig();
-    if (config.KALSHI_API_KEY_ID && fs.existsSync(config.KALSHI_PRIVATE_KEY_PATH)) {
+    // Try env var first (Fly secrets pattern), then file path (local dev pattern)
+    let pemContent: string | null = null;
+    if (config.KALSHI_PRIVATE_KEY) {
+      pemContent = config.KALSHI_PRIVATE_KEY;
+    } else if (fs.existsSync(config.KALSHI_PRIVATE_KEY_PATH)) {
       try {
-        this.apiKeyId = config.KALSHI_API_KEY_ID;
-        this.privateKey = fs.readFileSync(config.KALSHI_PRIVATE_KEY_PATH, 'utf8');
-        this.hasCredentials = true;
-        log.info('Kalshi client initialized with credentials');
+        pemContent = fs.readFileSync(config.KALSHI_PRIVATE_KEY_PATH, 'utf8');
       } catch (err) {
-        log.warn({ err }, 'Failed to load Kalshi credentials - degrading to read-only public data');
+        log.warn({ err }, 'Failed to read Kalshi private key file');
       }
+    }
+
+    if (config.KALSHI_API_KEY_ID && pemContent) {
+      this.apiKeyId = config.KALSHI_API_KEY_ID;
+      this.privateKey = pemContent;
+      this.hasCredentials = true;
+      log.info({ keyId: config.KALSHI_API_KEY_ID.slice(0, 8) + '...' }, 'Kalshi client initialized with credentials');
     } else {
-      log.info('Kalshi connector running in PAPER mode (no credentials - public market data only)');
+      log.info({ hasKeyId: !!config.KALSHI_API_KEY_ID, hasKey: !!pemContent }, 'Kalshi connector running without credentials (public market data only)');
     }
 
     if (!isPaperMode() && !this.hasCredentials) {
