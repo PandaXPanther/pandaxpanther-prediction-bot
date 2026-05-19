@@ -1,0 +1,42 @@
+{
+  "name": "pandaxpanther-prediction-bot",
+  "version": "0.1.0",
+  "description": "Autonomous prediction market trading bot for Polymarket + Kalshi",
+  "private": true,
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "strategy:sum-to-one": "tsx src/strategies/sumToOne.ts",
+    "strategy:cross-platform": "tsx src/strategies/crossPlatform.ts",
+    "strategy:crypto-latency": "tsx src/strategies/cryptoLatency.ts",
+    "strategy:weather": "tsx src/strategies/weatherSignal.ts",
+    "all": "tsx src/index.ts",
+    "lint": "eslint src --ext .ts",
+    "test": "vitest"
+  },
+  "dependencies": {
+    "@polymarket/clob-client": "^4.18.0",
+    "@supabase/supabase-js": "^2.45.0",
+    "axios": "^1.7.0",
+    "dotenv": "^16.4.5",
+    "ethers": "^6.13.0",
+    "p-queue": "^8.0.1",
+    "pino": "^9.4.0",
+    "pino-pretty": "^11.2.0",
+    "ws": "^8.18.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.0",
+    "@types/ws": "^8.5.12",
+    "eslint": "^9.10.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

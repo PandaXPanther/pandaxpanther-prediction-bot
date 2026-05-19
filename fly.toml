@@ -1,0 +1,25 @@
+app = "pandaxpanther-prediction-bot"
+primary_region = "den"  # Denver — close to you
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  NODE_ENV = "production"
+  LOG_LEVEL = "info"
+  TRADING_MODE = "paper"  # Override via `fly secrets set TRADING_MODE=live` when ready
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
+
+# No public HTTP service — pure background worker
+[processes]
+  bot = "node dist/index.js"
+
+[checks.alive]
+  type = "tcp"
+  port = 8080
+  interval = "30s"
+  timeout = "5s"
+  grace_period = "60s"
