@@ -9,6 +9,7 @@ primary_region = "dfw"  # Dallas - was Denver but Fly deprecated DEN region
   LOG_LEVEL = "info"
   TRADING_MODE = "paper"
   PERMISSIVE_PAPER = "true"
+  PING_PAPER_FILLS = "true"  # ping Discord on every paper signal during early testing
   DAILY_LOSS_CAP_USD = "200"
   MAX_POSITION_PER_MARKET_USD = "250"
   PLATFORM_MODE = "kalshi_only"  # disables all Polymarket-dependent strategies

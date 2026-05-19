@@ -19,7 +19,7 @@ import { KalshiConnector } from '../connectors/kalshi.js';
 import { getRiskEngine } from '../risk/riskEngine.js';
 import { createStrategyLogger } from '../utils/logger.js';
 import { sendDiscord } from '../utils/discord.js';
-import { getConfig, isPermissive } from '../utils/config.js';
+import { getConfig, isPermissive, shouldPingPaperFills } from '../utils/config.js';
 import { upsertMarket, recordHeartbeat, recordSignal, recordOrder } from '../db/supabase.js';
 import axios from 'axios';
 
@@ -259,6 +259,22 @@ export class SportsLatencyStrategy {
 
     this.inFlight.add(market.ticker);
     log.info({ ticker: market.ticker, state, modelYesProb, marketMid, divergence, side, sizeContracts }, 'Sports signal');
+
+    if (shouldPingPaperFills()) {
+      await sendDiscord(
+        `🔔 Sports signal (${state})`,
+        market.title,
+        'success',
+        [
+          { name: 'ESPN home WP', value: market.yesIsHome ? modelYesProb.toFixed(3) : (1 - modelYesProb).toFixed(3), inline: true },
+          { name: 'Kalshi mid', value: marketMid.toFixed(3), inline: true },
+          { name: 'Divergence', value: `${(divergence * 100).toFixed(1)}pp`, inline: true },
+          { name: 'Side', value: side, inline: true },
+          { name: 'Size', value: `${sizeContracts} @ \$${entryPrice.toFixed(2)}`, inline: true },
+          { name: 'Mode', value: 'PAPER', inline: true },
+        ]
+      );
+    }
 
     try {
       const result = await this.kalshi.placeOrder({

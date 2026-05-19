@@ -81,6 +81,22 @@ class ProbResponse(BaseModel):
     source_data_points: int
 
 
+@app.get("/")
+def root():
+    return {
+        "service": "pandaxpanther-quant",
+        "status": "ok",
+        "endpoints": [
+            "/health",
+            "/weather/prob?station=KNYC&metric=high_temp_f&threshold=85&direction=above",
+            "/macro/gdp-prob?threshold=3.0&direction=above",
+            "/macro/cpi-prob?threshold=3.0&direction=above",
+            "/sports/games?league=nba",
+            "/sports/win-prob?league=nba&event_id=401873341",
+        ],
+    }
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "stations": list(STATIONS.keys())}

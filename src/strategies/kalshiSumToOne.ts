@@ -25,7 +25,7 @@ import { KalshiConnector } from '../connectors/kalshi.js';
 import { getRiskEngine } from '../risk/riskEngine.js';
 import { createStrategyLogger } from '../utils/logger.js';
 import { sendDiscord } from '../utils/discord.js';
-import { isPermissive, getConfig } from '../utils/config.js';
+import { isPermissive, getConfig, shouldPingPaperFills } from '../utils/config.js';
 import { upsertMarket, recordSignal, recordOrder, recordHeartbeat } from '../db/supabase.js';
 import axios from 'axios';
 
@@ -206,6 +206,22 @@ export class KalshiSumToOneStrategy {
 
     this.inFlight.add(snap.ticker);
     log.info({ ticker: snap.ticker, sum, netEdge, sizeContracts }, 'Kalshi sum-to-one opportunity');
+
+    if (shouldPingPaperFills()) {
+      await sendDiscord(
+        '🔔 Kalshi sum-to-one opportunity',
+        snap.title,
+        'success',
+        [
+          { name: 'YES ask', value: snap.yesAsk.toFixed(4), inline: true },
+          { name: 'NO ask', value: snap.noAsk.toFixed(4), inline: true },
+          { name: 'Sum', value: sum.toFixed(4), inline: true },
+          { name: 'Net edge', value: `${(netEdge * 100).toFixed(2)}%`, inline: true },
+          { name: 'Size', value: sizeContracts.toString(), inline: true },
+          { name: 'Mode', value: 'PAPER', inline: true },
+        ]
+      );
+    }
 
     try {
       const [yesRes, noRes] = await Promise.all([

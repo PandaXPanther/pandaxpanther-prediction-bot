@@ -10,6 +10,7 @@ const ConfigSchema = z.object({
   // Mode
   TRADING_MODE: z.enum(['paper', 'live']).default('paper'),
   PERMISSIVE_PAPER: z.coerce.boolean().default(false),
+  PING_PAPER_FILLS: z.coerce.boolean().default(false),  // Discord-ping paper fills too (verbose - testing only)
   DAILY_LOSS_CAP_USD: z.coerce.number().positive().default(200),
   MAX_POSITION_PER_MARKET_USD: z.coerce.number().positive().default(250),
 
@@ -92,4 +93,9 @@ export function isPermissive(): boolean {
   const c = getConfig();
   if (c.TRADING_MODE === 'live') return false;
   return c.PERMISSIVE_PAPER;
+}
+
+/** Should we Discord-ping every paper fill? Verbose - intended for early testing only. */
+export function shouldPingPaperFills(): boolean {
+  return getConfig().PING_PAPER_FILLS;
 }
