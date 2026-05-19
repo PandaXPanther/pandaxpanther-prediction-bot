@@ -72,16 +72,10 @@ export class KalshiConnector implements MarketConnector {
       throw new Error('Kalshi credentials required for live mode');
     }
 
-    // Only attempt WebSocket if we have creds (Kalshi WSS requires auth)
-    if (this.hasCredentials) {
-      try {
-        await this.openWebSocket();
-      } catch (err) {
-        log.warn({ err }, 'Kalshi WS connect failed - continuing without real-time book');
-      }
-    } else {
-      log.info('Skipping Kalshi WS (requires auth) - will poll REST for market data');
-    }
+    // Kalshi WS auth is finicky (different sig scheme) and we don't actually
+    // need it for current strategies - REST orderbook polling is sufficient.
+    // Skip WS entirely to stop reconnect-spam in logs.
+    log.info('Kalshi WS disabled - using authenticated REST orderbook polling instead');
   }
 
   /**

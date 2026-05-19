@@ -11,6 +11,7 @@ const ConfigSchema = z.object({
   TRADING_MODE: z.enum(['paper', 'live']).default('paper'),
   PERMISSIVE_PAPER: z.coerce.boolean().default(false),
   PING_PAPER_FILLS: z.coerce.boolean().default(false),  // Discord-ping paper fills too (verbose - testing only)
+  AGGRESSIVE: z.coerce.boolean().default(false),  // Drop signal thresholds for maximum firings
   DAILY_LOSS_CAP_USD: z.coerce.number().positive().default(200),
   MAX_POSITION_PER_MARKET_USD: z.coerce.number().positive().default(250),
 
@@ -99,4 +100,9 @@ export function isPermissive(): boolean {
 /** Should we Discord-ping every paper fill? Verbose - intended for early testing only. */
 export function shouldPingPaperFills(): boolean {
   return getConfig().PING_PAPER_FILLS;
+}
+
+/** Is aggressive mode on? Drops thresholds + raises Kelly fraction. */
+export function isAggressive(): boolean {
+  return getConfig().AGGRESSIVE;
 }

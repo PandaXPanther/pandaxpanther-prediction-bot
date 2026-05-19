@@ -19,7 +19,7 @@ import { KalshiConnector } from '../connectors/kalshi.js';
 import { getRiskEngine } from '../risk/riskEngine.js';
 import { createStrategyLogger } from '../utils/logger.js';
 import { sendDiscord } from '../utils/discord.js';
-import { getConfig, isPermissive, shouldPingPaperFills } from '../utils/config.js';
+import { getConfig, isPermissive, shouldPingPaperFills, isAggressive } from '../utils/config.js';
 import { upsertMarket, recordHeartbeat, recordSignal, recordOrder } from '../db/supabase.js';
 import axios from 'axios';
 
@@ -31,7 +31,7 @@ const MIN_DIVERGENCE_PROD_IN = 0.06;         // 6pp in-game (ESPN WP is much sha
 const MIN_DIVERGENCE_PERMISSIVE = 0.04;      // 4pp in permissive
 
 function minDivergence(state: 'pre' | 'in' | 'post'): number {
-  if (isPermissive()) return MIN_DIVERGENCE_PERMISSIVE;
+  if (isPermissive() || isAggressive()) return MIN_DIVERGENCE_PERMISSIVE;
   return state === 'in' ? MIN_DIVERGENCE_PROD_IN : MIN_DIVERGENCE_PROD_PRE;
 }
 

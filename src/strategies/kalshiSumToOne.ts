@@ -25,7 +25,7 @@ import { KalshiConnector } from '../connectors/kalshi.js';
 import { getRiskEngine } from '../risk/riskEngine.js';
 import { createStrategyLogger } from '../utils/logger.js';
 import { sendDiscord } from '../utils/discord.js';
-import { isPermissive, getConfig, shouldPingPaperFills } from '../utils/config.js';
+import { isPermissive, getConfig, shouldPingPaperFills, isAggressive } from '../utils/config.js';
 import { upsertMarket, recordSignal, recordOrder, recordHeartbeat } from '../db/supabase.js';
 import axios from 'axios';
 
@@ -36,8 +36,9 @@ const MIN_EDGE_PROD = 0.015;             // 1.5% net minimum
 const TRIGGER_SUM_PERMISSIVE = 0.995;    // 0.5% gross edge
 const MIN_EDGE_PERMISSIVE = 0.002;       // 0.2% net edge
 
-const getTriggerSum = () => (isPermissive() ? TRIGGER_SUM_PERMISSIVE : TRIGGER_SUM_PROD);
-const getMinEdge = () => (isPermissive() ? MIN_EDGE_PERMISSIVE : MIN_EDGE_PROD);
+// Aggressive = same as permissive (drop thresholds way down)
+const getTriggerSum = () => (isPermissive() || isAggressive() ? TRIGGER_SUM_PERMISSIVE : TRIGGER_SUM_PROD);
+const getMinEdge = () => (isPermissive() || isAggressive() ? MIN_EDGE_PERMISSIVE : MIN_EDGE_PROD);
 
 interface KalshiMarketSnapshot {
   ticker: string;

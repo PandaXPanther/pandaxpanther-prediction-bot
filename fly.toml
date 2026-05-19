@@ -10,8 +10,10 @@ primary_region = "dfw"  # Dallas - was Denver but Fly deprecated DEN region
   TRADING_MODE = "live"  # LIVE - real money on Kalshi
   PERMISSIVE_PAPER = "false"
   PING_PAPER_FILLS = "false"
-  DAILY_LOSS_CAP_USD = "50"     # 10% of $500 - bot stops trading if it loses $50 in a day
-  MAX_POSITION_PER_MARKET_USD = "25"  # 5% of capital max per single market
+  # AGGRESSIVE MODE - user-requested
+  DAILY_LOSS_CAP_USD = "100"          # 20% of $500 - kill switch at $100/day loss
+  MAX_POSITION_PER_MARKET_USD = "75"  # 15% of capital max per single market
+  AGGRESSIVE = "true"                  # drop all signal thresholds for maximum firings
   PLATFORM_MODE = "kalshi_only"  # disables all Polymarket-dependent strategies
   # Kalshi-only strategy allocations
   ALLOC_WEATHER = "0.50"

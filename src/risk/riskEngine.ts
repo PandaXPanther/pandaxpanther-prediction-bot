@@ -1,4 +1,4 @@
-import { getConfig } from '../utils/config.js';
+import { getConfig, isAggressive } from '../utils/config.js';
 import { logger } from '../utils/logger.js';
 import { getSupabase } from '../db/supabase.js';
 import { sendDiscord } from '../utils/discord.js';
@@ -54,8 +54,10 @@ export class RiskEngine {
     const q = side === 'YES' ? modelProb : 1 - modelProb;
     if (q <= p) return 0;
     const fullKelly = (q - p) / (1 - p);
-    const fractionalKelly = fullKelly * 0.25;
-    return Math.max(0, Math.min(fractionalKelly, 0.05)); // cap at 5% of bankroll
+    // Aggressive: 50% Kelly with 15% bankroll cap. Conservative: 25% Kelly with 5% cap.
+    const fraction = isAggressive() ? 0.50 : 0.25;
+    const cap = isAggressive() ? 0.15 : 0.05;
+    return Math.max(0, Math.min(fullKelly * fraction, cap));
   }
 
   /**

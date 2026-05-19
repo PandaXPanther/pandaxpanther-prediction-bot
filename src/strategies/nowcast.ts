@@ -20,7 +20,7 @@ import { KalshiConnector } from '../connectors/kalshi.js';
 import { getRiskEngine } from '../risk/riskEngine.js';
 import { createStrategyLogger } from '../utils/logger.js';
 import { sendDiscord } from '../utils/discord.js';
-import { getConfig, isPermissive, shouldPingPaperFills } from '../utils/config.js';
+import { getConfig, isPermissive, shouldPingPaperFills, isAggressive } from '../utils/config.js';
 import { upsertMarket, recordHeartbeat, recordSignal, recordOrder } from '../db/supabase.js';
 import axios from 'axios';
 
@@ -28,7 +28,7 @@ const log = createStrategyLogger('nowcast');
 
 const MIN_DIVERGENCE_PROD = 0.10;        // 10pp prod
 const MIN_DIVERGENCE_PERMISSIVE = 0.04;  // 4pp permissive
-const getMinDivergence = () => (isPermissive() ? MIN_DIVERGENCE_PERMISSIVE : MIN_DIVERGENCE_PROD);
+const getMinDivergence = () => (isPermissive() || isAggressive() ? MIN_DIVERGENCE_PERMISSIVE : MIN_DIVERGENCE_PROD);
 
 // Kalshi series tickers for macro markets
 const MACRO_SERIES = [

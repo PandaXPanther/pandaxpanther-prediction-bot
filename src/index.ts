@@ -111,7 +111,23 @@ async function main() {
   process.on('SIGTERM', shutdown);
 }
 
-main().catch((err) => {
-  logger.fatal({ err }, 'Fatal error in main');
-  process.exit(1);
+// Global handlers so transient errors don't kill the bot.
+// Critical for production: a strategy throwing on one tick shouldn't crash
+// the whole orchestrator. Logged + swallowed.
+process.on('unhandledRejection', (reason, promise) => {
+  logger.error({ reason, promise }, 'Unhandled promise rejection');
 });
+process.on('uncaughtException', (err) => {
+  logger.error({ err: err.message, stack: err.stack }, 'Uncaught exception (continuing)');
+});
+
+main().catch((err) => {
+  logger.fatal({ err: err.message, stack: err.stack }, 'Fatal error in main - keeping process alive');
+  // Do NOT exit. Even if main() throws, the timers + WebSocket might still
+  // work and we'd rather have a degraded bot than a restart loop.
+});
+
+// Keep process alive forever - belt and suspenders. Some Node versions exit
+// when all 'awaited' Promises settle. setInterval should be enough, but this
+// is a guarantee.
+setInterval(() => {}, 1 << 30);

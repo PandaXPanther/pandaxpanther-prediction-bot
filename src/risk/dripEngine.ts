@@ -34,11 +34,8 @@ export class DripEngine {
       this.lastBalance = initial;
       getRiskEngine().setBankroll(initial);
       log.info({ startingBalance: initial }, 'DRIP engine started');
-      await sendDiscord(
-        '💰 DRIP engine started',
-        `Starting bankroll: $${initial.toFixed(2)}. Profits will automatically compound into trade sizing.`,
-        'success',
-      );
+      // No Discord ping on startup - Fly restarts spam the channel.
+      // Only ping on actual profit events.
     } else {
       log.warn('DRIP engine: starting balance is 0 - check Kalshi credentials');
     }
