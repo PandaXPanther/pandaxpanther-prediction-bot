@@ -18,6 +18,7 @@ import { PolymarketConnector } from './connectors/polymarket.js';
 import { KalshiConnector } from './connectors/kalshi.js';
 import { PriceFeedAggregator } from './connectors/priceFeeds.js';
 import { getRiskEngine } from './risk/riskEngine.js';
+import { DripEngine } from './risk/dripEngine.js';
 import { SumToOneStrategy } from './strategies/sumToOne.js';
 import { CrossPlatformStrategy } from './strategies/crossPlatform.js';
 import { CryptoLatencyStrategy } from './strategies/cryptoLatency.js';
@@ -49,12 +50,10 @@ async function main() {
     ]);
   }
 
-  // Sync bankroll from live balances
-  const kBal = await kalshi.getBalance();
-  const pmBal = polymarket ? await polymarket.getBalance() : 0;
-  const totalBankroll = pmBal + kBal;
-  getRiskEngine().setBankroll(totalBankroll);
-  logger.info({ pmBal, kBal, totalBankroll }, 'Bankroll synced');
+  // Start DRIP engine - fetches real Kalshi balance every 5 min and
+  // compounds profits automatically into the risk engine bankroll.
+  const drip = new DripEngine(kalshi);
+  await drip.start();
 
   const strategies: { name: string; start: () => Promise<void> }[] = isKalshiOnly()
     ? [

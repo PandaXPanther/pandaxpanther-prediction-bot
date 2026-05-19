@@ -84,9 +84,18 @@ export class KalshiConnector implements MarketConnector {
     }
   }
 
-  private sign(method: string, path: string, ts: number): Record<string, string> {
+  /**
+   * Sign a request. CRITICAL: path must NOT include query string - Kalshi
+   * signs only the base path. The base path also has to start with
+   * /trade-api/v2 (not just the route).
+   */
+  private sign(method: string, fullPath: string, ts: number): Record<string, string> {
     if (!this.privateKey || !this.apiKeyId) return {};
-    const message = `${ts}${method}${path}`;
+    // Strip query string
+    const path = fullPath.split('?')[0];
+    // Ensure full /trade-api/v2 prefix
+    const signedPath = path.startsWith('/trade-api/v2') ? path : `/trade-api/v2${path}`;
+    const message = `${ts}${method}${signedPath}`;
     const signer = crypto.createSign('RSA-SHA256');
     signer.update(message);
     signer.end();
@@ -220,42 +229,47 @@ export class KalshiConnector implements MarketConnector {
   }
 
   /**
-   * Authenticated orderbook fetch. The public REST /markets endpoint returns
-   * null prices for nearly all markets; only the signed orderbook endpoint
-   * returns real bids/asks.
+   * Authenticated orderbook fetch.
    *
-   * Returns: { yesAsk, noAsk } in CENTS (1-99), or null if no data.
+   * Kalshi response shape:
+   *   orderbook_fp: {
+   *     yes_dollars: [["0.45", "123.45"], ...]    YES BIDS sorted asc by price
+   *     no_dollars:  [["0.55", "50.00"], ...]     NO BIDS sorted asc by price
+   *   }
+   * Prices are STRINGS in dollars (0.01-0.99). Quantities are dollar amounts
+   * of liquidity at that level.
+   *
+   * Best YES ask = 1 - max(NO_BID) since selling NO at $X = buying YES at $(1-X)
+   * Best NO ask  = 1 - max(YES_BID)
+   *
+   * Returns prices in CENTS (1-99) for consistency with the rest of the codebase.
    */
   async getMarketOrderbook(ticker: string): Promise<{ yesAsk: number | null; noAsk: number | null; yesAskQty: number; noAskQty: number } | null> {
     if (!this.hasCredentials) return null;
     try {
-      const headers = this.sign('GET', `/trade-api/v2/markets/${ticker}/orderbook`, Date.now());
+      const ts = Date.now();
+      const headers = this.sign('GET', `/markets/${ticker}/orderbook`, ts);
       const { data } = await this.http.get(`/markets/${ticker}/orderbook`, { headers });
-      const ob = data?.orderbook;
+      const ob = data?.orderbook_fp ?? data?.orderbook;
       if (!ob) return null;
 
-      // Kalshi orderbook format:
-      //   { yes: [[price_cents, qty], ...], no: [[price_cents, qty], ...] }
-      // Sorted descending by price (best ask = LOWEST yes_ask = HIGHEST price someone
-      // is willing to BUY YES at, paradoxically. The API returns BIDS not asks.)
-      // Actually Kalshi's convention: "yes" array = YES bids (people buying YES).
-      // For YES ask we look at NO bids (the inverse). This is messy - simpler:
-      //   yes ask  = 100 - max(no_bid)
-      //   no ask   = 100 - max(yes_bid)
-      const yesBids: [number, number][] = ob.yes ?? [];
-      const noBids: [number, number][] = ob.no ?? [];
-      const maxYesBid = yesBids.length > 0 ? Math.max(...yesBids.map((b) => b[0])) : null;
-      const maxNoBid = noBids.length > 0 ? Math.max(...noBids.map((b) => b[0])) : null;
-      const yesAsk = maxNoBid != null ? 100 - maxNoBid : null;
-      const noAsk = maxYesBid != null ? 100 - maxYesBid : null;
-      // Best ask qty = qty at the price level that produced the inverse
-      const yesAskQty = maxNoBid != null ? (noBids.find((b) => b[0] === maxNoBid)?.[1] ?? 0) : 0;
-      const noAskQty = maxYesBid != null ? (yesBids.find((b) => b[0] === maxYesBid)?.[1] ?? 0) : 0;
-
+      const yesBids = (ob.yes_dollars ?? ob.yes ?? []) as [string, string][];
+      const noBids = (ob.no_dollars ?? ob.no ?? []) as [string, string][];
+      const parseEntries = (arr: [string, string][]) =>
+        arr.map(([p, q]) => [parseFloat(p), parseFloat(q)] as [number, number]).filter(([p]) => !isNaN(p));
+      const yesParsed = parseEntries(yesBids);
+      const noParsed = parseEntries(noBids);
+      const maxYesBid = yesParsed.length > 0 ? Math.max(...yesParsed.map((b) => b[0])) : null;
+      const maxNoBid = noParsed.length > 0 ? Math.max(...noParsed.map((b) => b[0])) : null;
+      // Convert dollars to cents
+      const yesAsk = maxNoBid != null ? Math.round((1 - maxNoBid) * 100) : null;
+      const noAsk = maxYesBid != null ? Math.round((1 - maxYesBid) * 100) : null;
+      const yesAskQty = maxNoBid != null ? (noParsed.find((b) => b[0] === maxNoBid)?.[1] ?? 0) : 0;
+      const noAskQty = maxYesBid != null ? (yesParsed.find((b) => b[0] === maxYesBid)?.[1] ?? 0) : 0;
       return { yesAsk, noAsk, yesAskQty, noAskQty };
     } catch (err: any) {
-      if (err.response?.status !== 404) {
-        log.debug({ ticker, status: err.response?.status }, 'Orderbook fetch error');
+      if (err.response?.status && err.response.status !== 404) {
+        log.debug({ ticker, status: err.response.status, body: JSON.stringify(err.response.data).slice(0, 150) }, 'Orderbook fetch error');
       }
       return null;
     }
@@ -361,15 +375,19 @@ export class KalshiConnector implements MarketConnector {
   }
 
   async getBalance(): Promise<number> {
-    if (isPaperMode()) return 5000;
+    // Even in paper mode, return REAL balance if we have credentials - that
+    // way risk engine bankroll matches actual capital available for live mode.
+    if (!this.hasCredentials) return isPaperMode() ? 5000 : 0;
     try {
       const ts = Date.now();
-      const headers = this.sign('GET', '/trade-api/v2/portfolio/balance', ts);
+      const headers = this.sign('GET', '/portfolio/balance', ts);
       const { data } = await this.http.get('/portfolio/balance', { headers });
       // Kalshi returns balance in cents
-      return (data.balance ?? 0) / 100;
-    } catch (err) {
-      log.error({ err }, 'Kalshi getBalance error');
+      const dollars = (data.balance ?? 0) / 100;
+      log.info({ dollars, raw: data.balance }, 'Kalshi balance fetched');
+      return dollars;
+    } catch (err: any) {
+      log.error({ err: err.message, status: err.response?.status }, 'Kalshi getBalance error');
       return 0;
     }
   }
