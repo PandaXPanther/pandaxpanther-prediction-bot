@@ -42,23 +42,38 @@ export class KalshiConnector implements MarketConnector {
     });
   }
 
+  // True if we have full API credentials loaded
+  private hasCredentials = false;
+
   async connect(): Promise<void> {
     const config = getConfig();
-    if (!isPaperMode()) {
-      if (!config.KALSHI_API_KEY_ID) {
-        throw new Error('KALSHI_API_KEY_ID required for live mode');
-      }
-      this.apiKeyId = config.KALSHI_API_KEY_ID;
+    if (config.KALSHI_API_KEY_ID && fs.existsSync(config.KALSHI_PRIVATE_KEY_PATH)) {
       try {
+        this.apiKeyId = config.KALSHI_API_KEY_ID;
         this.privateKey = fs.readFileSync(config.KALSHI_PRIVATE_KEY_PATH, 'utf8');
-      } catch {
-        throw new Error(`Kalshi private key not found at ${config.KALSHI_PRIVATE_KEY_PATH}`);
+        this.hasCredentials = true;
+        log.info('Kalshi client initialized with credentials');
+      } catch (err) {
+        log.warn({ err }, 'Failed to load Kalshi credentials - degrading to read-only public data');
       }
-      log.info('Kalshi client initialized');
     } else {
-      log.info('Kalshi connector running in PAPER mode');
+      log.info('Kalshi connector running in PAPER mode (no credentials - public market data only)');
     }
-    await this.openWebSocket();
+
+    if (!isPaperMode() && !this.hasCredentials) {
+      throw new Error('Kalshi credentials required for live mode');
+    }
+
+    // Only attempt WebSocket if we have creds (Kalshi WSS requires auth)
+    if (this.hasCredentials) {
+      try {
+        await this.openWebSocket();
+      } catch (err) {
+        log.warn({ err }, 'Kalshi WS connect failed - continuing without real-time book');
+      }
+    } else {
+      log.info('Skipping Kalshi WS (requires auth) - will poll REST for market data');
+    }
   }
 
   private sign(method: string, path: string, ts: number): Record<string, string> {
@@ -197,11 +212,11 @@ export class KalshiConnector implements MarketConnector {
   }
 
   async listActiveMarkets(category?: string): Promise<MarketInfo[]> {
-    const params: Record<string, string | number> = { status: 'open', limit: 1000 };
+    // Kalshi /markets endpoint is PUBLIC - no auth needed for read
+    const params: Record<string, string | number> = { status: 'open', limit: 200 };
     if (category) params.series_ticker = category;
     try {
-      const ts = Date.now();
-      const headers = isPaperMode() ? {} : this.sign('GET', '/trade-api/v2/markets', ts);
+      const headers = this.hasCredentials ? this.sign('GET', '/trade-api/v2/markets', Date.now()) : {};
       const { data } = await this.http.get('/markets', { params, headers });
       return (data.markets ?? []).map((m: any) => ({
         platform: 'kalshi' as const,

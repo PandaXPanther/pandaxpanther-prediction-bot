@@ -44,6 +44,10 @@ interface MarketPair {
 
 export class SumToOneStrategy {
   private pairs = new Map<string, MarketPair>();
+  private bookUpdateCount = 0;
+  private opportunitiesSeen = 0;
+  private bestSumSeen = 2;          // running minimum of (yesAsk + noAsk)
+  private bestSumQuestion = '';
 
   constructor(private polymarket: PolymarketConnector) {}
 
@@ -51,6 +55,25 @@ export class SumToOneStrategy {
     log.info('Sum-to-one strategy starting');
     await this.discoverAndSubscribe();
     setInterval(() => this.discoverAndSubscribe(), 15 * 60 * 1000); // refresh every 15 min
+
+    // Periodic visibility into how alive the strategy is
+    setInterval(() => {
+      const pairsWithBooks = [...this.pairs.values()].filter(
+        (p) => p.yesBook?.bestAsk || p.noBook?.bestAsk
+      ).length;
+      const pairsWithBothSides = [...this.pairs.values()].filter(
+        (p) => p.yesBook?.bestAsk && p.noBook?.bestAsk
+      ).length;
+      log.info({
+        totalPairs: this.pairs.size,
+        pairsWithAnyBook: pairsWithBooks,
+        pairsWithBothSides,
+        bookUpdates: this.bookUpdateCount,
+        opportunitiesAboveThreshold: this.opportunitiesSeen,
+        bestSumSeen: this.bestSumSeen.toFixed(4),
+        bestMarket: this.bestSumQuestion.slice(0, 60),
+      }, '📊 sum_to_one heartbeat');
+    }, 30_000);
   }
 
   private async discoverAndSubscribe(): Promise<void> {
@@ -63,7 +86,7 @@ export class SumToOneStrategy {
     );
 
     let newCount = 0;
-    for (const m of viable.slice(0, 200)) { // cap subscriptions
+    for (const m of viable.slice(0, 100)) { // cap subscriptions to top-volume markets
       if (this.pairs.has(m.externalId)) continue;
       const pair: MarketPair = {
         conditionId: m.externalId,
@@ -75,10 +98,12 @@ export class SumToOneStrategy {
 
       await this.polymarket.subscribeOrderBook(m.yes_token!, (book) => {
         pair.yesBook = book;
+        this.bookUpdateCount++;
         this.checkArbitrage(pair);
       });
       await this.polymarket.subscribeOrderBook(m.no_token!, (book) => {
         pair.noBook = book;
+        this.bookUpdateCount++;
         this.checkArbitrage(pair);
       });
       newCount++;
@@ -96,7 +121,15 @@ export class SumToOneStrategy {
     const noAsk = pair.noBook.bestAsk.price;
     const sum = yesAsk + noAsk;
 
+    // Track tightest sum even when not actionable - useful for understanding markets
+    if (sum < this.bestSumSeen) {
+      this.bestSumSeen = sum;
+      this.bestSumQuestion = pair.question;
+    }
+
     if (sum >= TRIGGER_SUM) return;
+
+    this.opportunitiesSeen++;
 
     // We have a candidate. Compute size and check fees.
     const grossEdge = 1.0 - sum;

@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "description": "Autonomous prediction market trading bot for Polymarket + Kalshi",
   "private": true,
+  "type": "module",
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",

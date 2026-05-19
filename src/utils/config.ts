@@ -1,6 +1,11 @@
 import 'dotenv/config';
 import { z } from 'zod';
 
+// Treat empty strings as undefined so blank .env values fall through to defaults
+for (const k of Object.keys(process.env)) {
+  if (process.env[k] === '') delete process.env[k];
+}
+
 const ConfigSchema = z.object({
   // Mode
   TRADING_MODE: z.enum(['paper', 'live']).default('paper'),
@@ -34,11 +39,11 @@ const ConfigSchema = z.object({
   NOAA_FORECAST_URL: z.string().url().default('https://api.weather.gov'),
 
   // Supabase
-  SUPABASE_URL: z.string().url().optional(),
+  SUPABASE_URL: z.union([z.string().url(), z.literal('')]).optional(),
   SUPABASE_SERVICE_ROLE_KEY: z.string().optional(),
 
   // Alerts
-  DISCORD_WEBHOOK_URL: z.string().url().optional(),
+  DISCORD_WEBHOOK_URL: z.union([z.string().url(), z.literal('')]).optional(),
   LOG_LEVEL: z.enum(['trace', 'debug', 'info', 'warn', 'error']).default('info'),
 
   // Quant

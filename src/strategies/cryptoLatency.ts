@@ -121,23 +121,53 @@ export class CryptoLatencyStrategy {
   }
 
   /**
-   * Parse "Will BTC close above $105,000 at 4pm ET?" style questions.
-   * Best-effort regex parse — could be replaced with an LLM call.
+   * Parse questions like:
+   *   "Will BTC close above $105,000 at 4pm ET?"
+   *   "Bitcoin above 105K on May 20?"
+   *
+   * Skips question patterns we can't reliably interpret. Notably, the
+   * "Crypto Up or Down" hourly markets don't have an absolute price strike
+   * (they resolve relative to open), so we exclude them.
    */
   private parseCryptoQuestion(q: string): { underlying: 'BTC' | 'ETH' | 'SOL'; strike: number; direction: 'above' | 'below' } | null {
     const lc = q.toLowerCase();
+
+    // Skip "Up or Down" markets - they resolve relative to interval open price,
+    // not an absolute strike, and need a different strategy entirely
+    if (/up or down|up\/down|higher or lower/.test(lc)) return null;
+
     let underlying: 'BTC' | 'ETH' | 'SOL';
-    if (lc.includes('bitcoin') || lc.includes('btc')) underlying = 'BTC';
-    else if (lc.includes('ethereum') || lc.includes('eth')) underlying = 'ETH';
-    else if (lc.includes('solana') || lc.includes('sol')) underlying = 'SOL';
+    if (lc.includes('bitcoin') || /\bbtc\b/.test(lc)) underlying = 'BTC';
+    else if (lc.includes('ethereum') || /\beth\b/.test(lc)) underlying = 'ETH';
+    else if (lc.includes('solana') || /\bsol\b/.test(lc)) underlying = 'SOL';
     else return null;
 
-    const priceMatch = q.match(/\$?([\d,]+(?:\.\d+)?)/);
-    if (!priceMatch) return null;
-    const strike = parseFloat(priceMatch[1].replace(/,/g, ''));
+    // Strike: explicit dollar sign OR number with K/M suffix
+    // Examples we want to match: $105,000  $200K  $1.2M  105000
+    const dollarMatch = q.match(/\$([\d,]+(?:\.\d+)?)\s*([kKmM]?)\b/);
+    const kMatch = q.match(/\b(\d[\d,]*(?:\.\d+)?)\s*([kKmM])\b/);
+    let strike: number | null = null;
+    if (dollarMatch) {
+      const base = parseFloat(dollarMatch[1].replace(/,/g, ''));
+      const mult = dollarMatch[2].toLowerCase() === 'k' ? 1000 : dollarMatch[2].toLowerCase() === 'm' ? 1_000_000 : 1;
+      strike = base * mult;
+    } else if (kMatch) {
+      const base = parseFloat(kMatch[1].replace(/,/g, ''));
+      const mult = kMatch[2].toLowerCase() === 'k' ? 1000 : 1_000_000;
+      strike = base * mult;
+    }
+    if (strike == null) return null;
+
+    // Sanity check by underlying - reject obviously wrong values
+    const reasonable = {
+      BTC: [10_000, 1_000_000],
+      ETH: [500, 20_000],
+      SOL: [10, 2000],
+    }[underlying];
+    if (strike < reasonable[0] || strike > reasonable[1]) return null;
 
     let direction: 'above' | 'below' = 'above';
-    if (/below|under|<|less/.test(lc)) direction = 'below';
+    if (/below|under|less than|<\s/.test(lc)) direction = 'below';
 
     return { underlying, strike, direction };
   }

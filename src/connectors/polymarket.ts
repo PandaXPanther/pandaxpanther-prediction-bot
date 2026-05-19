@@ -32,6 +32,9 @@ export class PolymarketConnector implements MarketConnector {
   private clobClient: any = null;
   private subscribers = new Map<string, ((book: OrderBook) => void)[]>();
   private bookState = new Map<string, { bids: Map<number, number>; asks: Map<number, number> }>();
+  // All asset_ids we've subscribed to so we can re-send on reconnect or batch-resub on add
+  private subscribedAssets = new Set<string>();
+  private resubTimer: NodeJS.Timeout | null = null;
 
   constructor() {
     const config = getConfig();
@@ -74,6 +77,8 @@ export class PolymarketConnector implements MarketConnector {
       this.ws = new WebSocket('wss://ws-subscriptions-clob.polymarket.com/ws/market');
       this.ws.on('open', () => {
         log.info('Polymarket WebSocket open');
+        // On reconnect, re-subscribe everything we had
+        if (this.subscribedAssets.size > 0) this.flushSubscriptions();
         resolve();
       });
       this.ws.on('message', (data) => this.handleMessage(data.toString()));
@@ -88,42 +93,51 @@ export class PolymarketConnector implements MarketConnector {
 
   private handleMessage(raw: string): void {
     try {
-      const msgs = JSON.parse(raw);
-      const list = Array.isArray(msgs) ? msgs : [msgs];
+      const parsed = JSON.parse(raw);
+      const list = Array.isArray(parsed) ? parsed : [parsed];
       for (const msg of list) {
-        if (msg.event_type === 'book' || msg.event_type === 'price_change') {
-          this.applyBookUpdate(msg);
+        // Polymarket WS sends two message shapes:
+        //   Snapshot:  { asset_id, bids:[{price,size}], asks:[{price,size}], ... }
+        //   Delta:     { price_changes: [{asset_id, price, size, side, best_bid, best_ask}, ...] }
+        if (msg.bids && msg.asks) {
+          this.applySnapshot(msg);
+        } else if (msg.price_changes) {
+          for (const ch of msg.price_changes) this.applyDelta(ch);
         }
       }
     } catch (err) {
-      log.debug({ err, raw }, 'WS parse error');
+      log.debug({ err, raw: raw.slice(0, 200) }, 'WS parse error');
     }
   }
 
-  private applyBookUpdate(msg: any): void {
+  private applySnapshot(msg: any): void {
     const assetId: string | undefined = msg.asset_id;
+    if (!assetId) return;
+    const state = { bids: new Map<number, number>(), asks: new Map<number, number>() };
+    for (const b of msg.bids ?? []) state.bids.set(parseFloat(b.price), parseFloat(b.size));
+    for (const a of msg.asks ?? []) state.asks.set(parseFloat(a.price), parseFloat(a.size));
+    this.bookState.set(assetId, state);
+    this.emitBook(assetId);
+  }
+
+  private applyDelta(change: any): void {
+    const assetId: string | undefined = change.asset_id;
     if (!assetId) return;
     if (!this.bookState.has(assetId)) {
       this.bookState.set(assetId, { bids: new Map(), asks: new Map() });
     }
     const state = this.bookState.get(assetId)!;
+    const price = parseFloat(change.price);
+    const size = parseFloat(change.size);
+    const side = change.side === 'BUY' ? state.bids : state.asks;
+    if (size === 0) side.delete(price);
+    else side.set(price, size);
+    this.emitBook(assetId);
+  }
 
-    if (msg.event_type === 'book') {
-      state.bids.clear();
-      state.asks.clear();
-      for (const b of msg.bids ?? []) state.bids.set(parseFloat(b.price), parseFloat(b.size));
-      for (const a of msg.asks ?? []) state.asks.set(parseFloat(a.price), parseFloat(a.size));
-    } else if (msg.event_type === 'price_change') {
-      for (const ch of msg.changes ?? []) {
-        const price = parseFloat(ch.price);
-        const size = parseFloat(ch.size);
-        const side = ch.side === 'BUY' ? state.bids : state.asks;
-        if (size === 0) side.delete(price);
-        else side.set(price, size);
-      }
-    }
-
-    // Build OrderBook view and dispatch
+  private emitBook(assetId: string): void {
+    const state = this.bookState.get(assetId);
+    if (!state) return;
     const sortedBids = [...state.bids.entries()].sort((a, b) => b[0] - a[0]);
     const sortedAsks = [...state.asks.entries()].sort((a, b) => a[0] - b[0]);
     const book: OrderBook = {
@@ -154,40 +168,54 @@ export class PolymarketConnector implements MarketConnector {
     const list = this.subscribers.get(externalId) ?? [];
     list.push(cb);
     this.subscribers.set(externalId, list);
-    this.ws.send(
-      JSON.stringify({
-        type: 'MARKET',
-        assets_ids: [externalId],
-      })
-    );
+    this.subscribedAssets.add(externalId);
+    // Debounce: batch all subscribe additions into one WS message
+    if (this.resubTimer) clearTimeout(this.resubTimer);
+    this.resubTimer = setTimeout(() => this.flushSubscriptions(), 150);
     return () => {
       const arr = this.subscribers.get(externalId) ?? [];
       this.subscribers.set(externalId, arr.filter((c) => c !== cb));
     };
   }
 
-  async listActiveMarkets(category?: string): Promise<MarketInfo[]> {
-    // Gamma API for market discovery
+  private flushSubscriptions(): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    const ids = [...this.subscribedAssets];
+    log.info({ count: ids.length }, 'Polymarket: flushing batched WS subscription');
+    this.ws.send(JSON.stringify({ type: 'MARKET', assets_ids: ids }));
+  }
+
+  async listActiveMarkets(_category?: string): Promise<MarketInfo[]> {
+    // Gamma API: order by descending volume so we get liquid markets first
     const url = 'https://gamma-api.polymarket.com/markets';
     const params: Record<string, string | number> = {
       active: 'true',
       closed: 'false',
-      limit: 500,
+      order: 'volume',
+      ascending: 'false',
+      limit: 200,
     };
-    if (category) params.tag = category;
     const { data } = await axios.get(url, { params });
-    return (data as any[]).map((m) => {
-      const tokens = JSON.parse(m.clobTokenIds ?? '[]');
-      return {
-        platform: 'polymarket' as const,
-        externalId: m.id?.toString() ?? m.conditionId,
-        question: m.question,
-        category: m.category,
-        closesAt: m.endDate ? new Date(m.endDate) : undefined,
-        yes_token: tokens[0],
-        no_token: tokens[1],
-      };
-    });
+    const out: MarketInfo[] = [];
+    for (const m of data as any[]) {
+      try {
+        const raw = m.clobTokenIds;
+        const tokens = typeof raw === 'string' ? JSON.parse(raw) : (Array.isArray(raw) ? raw : []);
+        if (!tokens[0] || !tokens[1]) continue;
+        out.push({
+          platform: 'polymarket' as const,
+          externalId: m.id?.toString() ?? m.conditionId,
+          question: m.question ?? m.slug ?? 'unknown',
+          category: m.category,
+          closesAt: m.endDate ? new Date(m.endDate) : undefined,
+          yes_token: tokens[0],
+          no_token: tokens[1],
+        });
+      } catch {
+        // skip malformed
+      }
+    }
+    return out;
   }
 
   async placeOrder(req: PlaceOrderRequest): Promise<PlaceOrderResult> {
