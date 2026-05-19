@@ -108,10 +108,15 @@ export class RiskEngine {
   private getStrategyAllocation(strategy: string): number {
     const config = getConfig();
     switch (strategy) {
+      // Original 'both' mode strategies
       case 'sum_to_one': return config.ALLOC_SUM_TO_ONE;
       case 'cross_platform': return config.ALLOC_CROSS_PLATFORM;
       case 'crypto_latency': return config.ALLOC_CRYPTO_LATENCY;
+      // Kalshi-only mode strategies
       case 'weather': return config.ALLOC_WEATHER;
+      case 'kalshi_sum_to_one': return config.ALLOC_KALSHI_SUM_TO_ONE;
+      case 'nowcast': return config.ALLOC_NOWCAST;
+      case 'sports_latency': return config.ALLOC_SPORTS_LATENCY;
       default: return 0.10;
     }
   }

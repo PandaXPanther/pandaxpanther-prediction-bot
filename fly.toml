@@ -11,13 +11,14 @@ primary_region = "dfw"  # Dallas - was Denver but Fly deprecated DEN region
   PERMISSIVE_PAPER = "true"
   DAILY_LOSS_CAP_USD = "200"
   MAX_POSITION_PER_MARKET_USD = "250"
-  POLYMARKET_HOST = "https://clob.polymarket.com"
-  POLYMARKET_CHAIN_ID = "137"
+  PLATFORM_MODE = "kalshi_only"  # disables all Polymarket-dependent strategies
+  # Kalshi-only strategy allocations
+  ALLOC_WEATHER = "0.50"
+  ALLOC_KALSHI_SUM_TO_ONE = "0.20"
+  ALLOC_NOWCAST = "0.20"
+  ALLOC_SPORTS_LATENCY = "0.10"
   KALSHI_HOST = "https://api.elections.kalshi.com/trade-api/v2"
   KALSHI_WSS = "wss://api.elections.kalshi.com/trade-api/ws/v2"
-  BINANCE_WS_URL = "wss://stream.binance.com:9443/ws"
-  BINANCE_DISABLED = "true"  # Fly IPs are geo-blocked by Binance; Coinbase covers
-  COINBASE_WS_URL = "wss://ws-feed.exchange.coinbase.com"
   NOAA_FORECAST_URL = "https://api.weather.gov"
 
 [[vm]]

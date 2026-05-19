@@ -11,7 +11,7 @@
  * Environment must include TRADING_MODE=paper for safe initial testing.
  */
 
-import { getConfig } from './utils/config.js';
+import { getConfig, isKalshiOnly } from './utils/config.js';
 import { logger } from './utils/logger.js';
 import { sendDiscord } from './utils/discord.js';
 import { PolymarketConnector } from './connectors/polymarket.js';
@@ -22,38 +22,59 @@ import { SumToOneStrategy } from './strategies/sumToOne.js';
 import { CrossPlatformStrategy } from './strategies/crossPlatform.js';
 import { CryptoLatencyStrategy } from './strategies/cryptoLatency.js';
 import { WeatherStrategy } from './strategies/weatherSignal.js';
+import { KalshiSumToOneStrategy } from './strategies/kalshiSumToOne.js';
+import { NowcastStrategy } from './strategies/nowcast.js';
+import { SportsLatencyStrategy } from './strategies/sportsLatency.js';
 
 async function main() {
   const config = getConfig();
-  logger.info({ mode: config.TRADING_MODE, bankroll: 5000 }, '🐼 PandaXPanther Prediction Bot starting');
+  const mode = isKalshiOnly() ? 'KALSHI-ONLY' : 'BOTH';
+  logger.info({ mode: config.TRADING_MODE, platformMode: mode, bankroll: 5000 }, '🐼 PandaXPanther Prediction Bot starting');
   await sendDiscord(
-    `🐼 Bot online (${config.TRADING_MODE.toUpperCase()})`,
-    'All strategies booting...',
+    `🐼 Bot online (${config.TRADING_MODE.toUpperCase()} · ${mode})`,
+    isKalshiOnly()
+      ? 'Kalshi-only stack: weather (50%), sum-to-one (20%), nowcast (20%), sports (10%).'
+      : 'Full stack: Polymarket + Kalshi.',
     'info'
   );
 
-  const polymarket = new PolymarketConnector();
   const kalshi = new KalshiConnector();
-  const priceFeeds = new PriceFeedAggregator();
+  await kalshi.connect().catch((err) => logger.error({ err }, 'Kalshi connect failed'));
 
-  await Promise.all([
-    polymarket.connect().catch((err) => logger.error({ err }, 'Polymarket connect failed')),
-    kalshi.connect().catch((err) => logger.error({ err }, 'Kalshi connect failed')),
-    priceFeeds.start().catch((err) => logger.error({ err }, 'Price feeds failed')),
-  ]);
+  // Polymarket + price feeds only needed for 'both' mode strategies
+  let polymarket: PolymarketConnector | null = null;
+  let priceFeeds: PriceFeedAggregator | null = null;
+  if (!isKalshiOnly()) {
+    polymarket = new PolymarketConnector();
+    priceFeeds = new PriceFeedAggregator();
+    await Promise.all([
+      polymarket.connect().catch((err) => logger.error({ err }, 'Polymarket connect failed')),
+      priceFeeds.start().catch((err) => logger.error({ err }, 'Price feeds failed')),
+    ]);
+  }
 
-  // Sync bankroll from live balances (paper mode returns simulated $5K each)
-  const [pmBal, kBal] = await Promise.all([polymarket.getBalance(), kalshi.getBalance()]);
+  // Sync bankroll from live balances
+  const kBal = await kalshi.getBalance();
+  const pmBal = polymarket ? await polymarket.getBalance() : 0;
   const totalBankroll = pmBal + kBal;
   getRiskEngine().setBankroll(totalBankroll);
   logger.info({ pmBal, kBal, totalBankroll }, 'Bankroll synced');
 
-  const strategies: { name: string; start: () => Promise<void> }[] = [
-    { name: 'sum_to_one', start: () => new SumToOneStrategy(polymarket).start() },
-    { name: 'cross_platform', start: () => new CrossPlatformStrategy(polymarket, kalshi).start() },
-    { name: 'crypto_latency', start: () => new CryptoLatencyStrategy(polymarket, priceFeeds).start() },
-    { name: 'weather', start: () => new WeatherStrategy(kalshi).start() },
-  ];
+  const strategies: { name: string; start: () => Promise<void> }[] = isKalshiOnly()
+    ? [
+        // Kalshi-only stack
+        { name: 'weather', start: () => new WeatherStrategy(kalshi).start() },
+        { name: 'kalshi_sum_to_one', start: () => new KalshiSumToOneStrategy(kalshi).start() },
+        { name: 'nowcast', start: () => new NowcastStrategy(kalshi).start() },
+        { name: 'sports_latency', start: () => new SportsLatencyStrategy(kalshi).start() },
+      ]
+    : [
+        // Full Polymarket + Kalshi stack
+        { name: 'sum_to_one', start: () => new SumToOneStrategy(polymarket!).start() },
+        { name: 'cross_platform', start: () => new CrossPlatformStrategy(polymarket!, kalshi).start() },
+        { name: 'crypto_latency', start: () => new CryptoLatencyStrategy(polymarket!, priceFeeds!).start() },
+        { name: 'weather', start: () => new WeatherStrategy(kalshi).start() },
+      ];
 
   for (const s of strategies) {
     s.start()
@@ -85,7 +106,10 @@ async function main() {
   // Graceful shutdown
   const shutdown = async () => {
     logger.info('Shutting down...');
-    await Promise.allSettled([polymarket.disconnect(), kalshi.disconnect(), priceFeeds.stop()]);
+    const tasks: Promise<any>[] = [kalshi.disconnect()];
+    if (polymarket) tasks.push(polymarket.disconnect());
+    if (priceFeeds) tasks.push(priceFeeds.stop());
+    await Promise.allSettled(tasks);
     process.exit(0);
   };
   process.on('SIGINT', shutdown);

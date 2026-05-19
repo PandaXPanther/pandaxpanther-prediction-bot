@@ -13,11 +13,18 @@ const ConfigSchema = z.object({
   DAILY_LOSS_CAP_USD: z.coerce.number().positive().default(200),
   MAX_POSITION_PER_MARKET_USD: z.coerce.number().positive().default(250),
 
-  // Allocations
+  // Platform mode - 'both' (original) or 'kalshi_only'
+  PLATFORM_MODE: z.enum(['both', 'kalshi_only']).default('both'),
+
+  // Allocations - 'both' platform mode
   ALLOC_SUM_TO_ONE: z.coerce.number().min(0).max(1).default(0.25),
   ALLOC_CROSS_PLATFORM: z.coerce.number().min(0).max(1).default(0.30),
   ALLOC_CRYPTO_LATENCY: z.coerce.number().min(0).max(1).default(0.30),
   ALLOC_WEATHER: z.coerce.number().min(0).max(1).default(0.15),
+  // Allocations - 'kalshi_only' platform mode
+  ALLOC_KALSHI_SUM_TO_ONE: z.coerce.number().min(0).max(1).default(0.20),
+  ALLOC_NOWCAST: z.coerce.number().min(0).max(1).default(0.20),
+  ALLOC_SPORTS_LATENCY: z.coerce.number().min(0).max(1).default(0.10),
 
   // Polymarket
   POLYMARKET_PRIVATE_KEY: z.string().optional(),
@@ -68,6 +75,10 @@ export function getConfig(): Config {
 
 export function isPaperMode(): boolean {
   return getConfig().TRADING_MODE === 'paper';
+}
+
+export function isKalshiOnly(): boolean {
+  return getConfig().PLATFORM_MODE === 'kalshi_only';
 }
 
 /**
