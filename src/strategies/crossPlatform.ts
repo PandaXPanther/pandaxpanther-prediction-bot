@@ -147,17 +147,56 @@ export class CrossPlatformStrategy {
   /**
    * Auto-discover weather pairs.
    *
-   * Polymarket lists weather questions like:
-   *   "Will the highest temperature in NYC be between 89-90°F on May 20?"
-   * Kalshi lists the same as ticker:
-   *   KXHIGHNY-26MAY20-B89.5  (B = bucket, midpoint of range)
+   * Polymarket lists weather questions per-event at:
+   *   gamma-api.polymarket.com/events?slug=highest-temperature-in-<city>-on-<month>-<day>
    *
-   * We pull all Polymarket weather contracts, parse them, and verify each
-   * matching Kalshi ticker exists via the public /markets endpoint.
+   * For each known Polymarket weather city, we probe for upcoming dates,
+   * pull each event's contracts, and match to Kalshi tickers via
+   *   KXHIGH<CITY>-<YY><MON><DD>-B<midpoint>  (range bucket)
+   *   KXHIGH<CITY>-<YY><MON><DD>-T<threshold> (above threshold)
    */
   private async discoverWeatherPairs(): Promise<void> {
     try {
-      const pmMarkets = await this.polymarket.listActiveMarkets();
+      // 1. Probe Polymarket events for the next 3 days, per known city
+      const PM_CITIES = ['nyc', 'la', 'chicago', 'miami', 'denver', 'seattle', 'phoenix', 'houston', 'boston', 'atlanta', 'philadelphia', 'austin', 'san-francisco'];
+      const now = new Date();
+      const dateSlugs: string[] = [];
+      for (let i = 0; i < 4; i++) {
+        const d = new Date(now);
+        d.setDate(now.getDate() + i);
+        const month = d.toLocaleString('en-US', { month: 'long' }).toLowerCase();
+        dateSlugs.push(`${month}-${d.getDate()}`);
+      }
+      const pmMarkets: { question: string; yes_token: string; no_token: string }[] = [];
+      for (const city of PM_CITIES) {
+        for (const dateSlug of dateSlugs) {
+          const slug = `highest-temperature-in-${city}-on-${dateSlug}`;
+          try {
+            const r = await axios.get(`https://gamma-api.polymarket.com/events?slug=${slug}`, {
+              timeout: 5000,
+              headers: { 'User-Agent': 'panda-bot' },
+            });
+            const events = (r.data ?? []) as Array<{ markets?: any[] }>;
+            for (const ev of events) {
+              for (const m of ev.markets ?? []) {
+                const tokens = typeof m.clobTokenIds === 'string'
+                  ? JSON.parse(m.clobTokenIds)
+                  : (m.clobTokenIds ?? []);
+                if (tokens.length < 2) continue;
+                pmMarkets.push({
+                  question: m.question,
+                  yes_token: tokens[0],
+                  no_token: tokens[1],
+                });
+              }
+            }
+          } catch {
+            // event doesn't exist - skip silently
+          }
+        }
+      }
+      log.info({ pmFound: pmMarkets.length }, 'Polymarket weather markets fetched for matching');
+
       let discovered = 0;
       let verified = 0;
 
