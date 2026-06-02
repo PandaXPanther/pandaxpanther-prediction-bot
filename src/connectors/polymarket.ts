@@ -1,4 +1,5 @@
 import axios, { AxiosInstance } from 'axios';
+import { attachRetryInterceptor } from '../utils/httpResilience.js';
 import WebSocket from 'ws';
 import { getConfig, isPaperMode } from '../utils/config.js';
 import { createStrategyLogger } from '../utils/logger.js';
@@ -42,6 +43,7 @@ export class PolymarketConnector implements MarketConnector {
       baseURL: config.POLYMARKET_HOST,
       timeout: 10000,
     });
+    attachRetryInterceptor(this.http, 'polymarket');
   }
 
   async connect(): Promise<void> {

@@ -40,22 +40,35 @@ export async function sendDiscord(
   const userId = config.DISCORD_NOTIFY_USER_ID;
   const content = mention && userId ? `<@${userId}>` : undefined;
 
-  try {
-    await axios.post(config.DISCORD_WEBHOOK_URL, {
-      content,
-      allowed_mentions: userId ? { users: [userId] } : undefined,
-      embeds: [
-        {
-          title,
-          description: message,
-          color: COLORS[level],
-          fields: fields ?? [],
-          timestamp: new Date().toISOString(),
-          footer: { text: `PandaXPanther Prediction Bot · ${config.TRADING_MODE.toUpperCase()}` },
-        },
-      ],
-    });
-  } catch (err) {
-    logger.warn({ err }, 'Failed to send Discord alert');
+  // v1 LOW-10: lightweight retry on 429/5xx. Single-shot failures used to lose the
+  // alert entirely; this covers ~2s of transient flakiness. We don't retry on 4xx
+  // (other than 429) since those are genuine payload issues.
+  const payload = {
+    content,
+    allowed_mentions: userId ? { users: [userId] } : undefined,
+    embeds: [
+      {
+        title,
+        description: message,
+        color: COLORS[level],
+        fields: fields ?? [],
+        timestamp: new Date().toISOString(),
+        footer: { text: `PandaXPanther Prediction Bot · ${config.TRADING_MODE.toUpperCase()}` },
+      },
+    ],
+  };
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      await axios.post(config.DISCORD_WEBHOOK_URL, payload, { timeout: 5000 });
+      return;
+    } catch (err: any) {
+      const status = err?.response?.status;
+      const retryable = !status || status === 429 || status >= 500;
+      if (!retryable || attempt === 3) {
+        logger.warn({ err: err?.message ?? String(err), status, attempt }, 'Failed to send Discord alert');
+        return;
+      }
+      await new Promise((r) => setTimeout(r, 200 * 2 ** (attempt - 1))); // 200ms, 400ms
+    }
   }
 }

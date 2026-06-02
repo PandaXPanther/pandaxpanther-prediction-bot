@@ -1,0 +1,1201 @@
+/**
+ * STRATEGY: Sports CLV — Closing-Line Value vs Pinnacle
+ *
+ * Uses Pinnacle Sports (the sharpest public closing line) as a proxy for true
+ * game probability. When Kalshi's implied probability deviates ≥5pp from the
+ * Pinnacle no-vig probability, we post a maker-only LIMIT order 2-6 hours
+ * pre-game. All open orders are cancelled 30 min before tip-off/kickoff to
+ * avoid in-game adverse selection.
+ *
+ * QUOTA MANAGEMENT: The Odds API free tier is 500 req/month. We only call
+ * it when there are actually open Kalshi sports markets for that sport.
+ * 15-min poll × only active sports = stays well under limit.
+ *
+ * SAFETY: If ODDS_API_KEY is unset, strategy no-ops. Maker-only orders only.
+ * Never trades <30 min before game. Quarter Kelly, cap $40/trade.
+ */
+
+import axios from 'axios';
+import { KalshiConnector } from '../connectors/kalshi.js';
+import { getRiskEngine } from '../risk/riskEngine.js';
+import { recordSignal, recordOrder, recordHeartbeat, upsertMarket, findOrderByExternalId, updateOrder } from '../db/supabase.js';
+import { sendDiscord } from '../utils/discord.js';
+import { getConfig } from '../utils/config.js';
+import { createStrategyLogger } from '../utils/logger.js';
+
+const log = createStrategyLogger('sports_clv');
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+// 2026-05-23: Sports CLV bumped from 15min → 5min on Chicago VPS.
+// Pinnacle odds drift continuously — catching a divergence at 5min mark
+// vs 15min mark = 10min more pre-game time to enter at favorable price.
+// 2026-05-23 v2 (post-Pinnacle-upgrade): default polling drops 5min → 60s when
+// SPORTS_FAST_POLL=true (requires Odds API $30/mo 20K-credit tier, gives ~14× headroom).
+// Slow 5-min mode still available without the upgrade.
+const FAST_POLL         = process.env.SPORTS_FAST_POLL === 'true';
+const POLL_MS           = FAST_POLL ? 60 * 1000 : 5 * 60 * 1000;
+// Kalshi book refresh stays at 60s either way (Kalshi REST is unlimited for us)
+const KALSHI_REFRESH_MS = 60 * 1000;
+const HEARTBEAT_MS      = 60 * 1000;         // 1 min heartbeat
+// 2026-05-23 v2: threshold raised to 3pp per latest research — 2pp doesn't
+// clear Kalshi vig structure reliably. Was previously 4pp; env var can override.
+// 2026-05-23 v3 (strategy_v3_optimization.pplx.md): MIN_DIV locked to 3pp.
+// Back-test of 31 Pinnacle–Kalshi pairs: median |divergence| 1.1pp. Below 3pp is
+// indistinguishable from model error. Networked CLV study: ~53% WR at ~1.8pp avg
+// edge translates to needing 3pp+ to clear the maker fee with margin.
+const MIN_DIV           = parseFloat(process.env.SPORTS_CLV_MIN_DIV ?? '0.03');
+const NO_ONLY            = process.env.SPORTS_NO_ONLY === 'true';
+const SKIP_TOSSUP_BAND   = process.env.SPORTS_SKIP_TOSSUP === 'true';  // skip $0.45-$0.55 entries
+// 2026-05-23 v2: cap reduced $40→$25, Kelly 0.25→0.15 per latest research.
+// 2026-05-23 v3: MAX_TRADE $25 → $20 + KELLY_MULT 0.15 → 0.08 (more conservative).
+// Rationale: <25 validated sports trades; Networked study realized ROI is 1.9–3.6%,
+// so 0.08 Kelly = 0.67× Kelly at expected 3pp edge — appropriate given low N.
+const MAX_TRADE_USD     = parseFloat(process.env.SPORTS_MAX_TRADE_USD || '20');
+const KELLY_MULT        = parseFloat(process.env.SPORTS_KELLY_MULT || '0.08');
+// v3.7: bankroll-floor circuit breaker. If account cash drops below this dollar value, bot stops opening new trades.
+// Defaults to no floor (0 = disabled). Set BANKROLL_HARD_STOP=900 to pause at $900.
+const BANKROLL_HARD_STOP = parseFloat(process.env.BANKROLL_HARD_STOP || '0');
+// v3.1: shortened 30min→5min so it doesn't conflict with new MIN_BEFORE_GAME_MS=30min.
+// At 5min pre-game, books get very thin and adverse selection rises — cancel any
+// unfilled maker orders to avoid bad fills on whatever stale price remains.
+const CANCEL_BEFORE_MS  = 5 * 60 * 1000;
+// 2026-05-23 v2: Refined to 2-8hr per latest research.
+// "First hour too noisy; beyond 8h Pinnacle has priced it out".
+// v3.1: widened window so bot can catch high-news pre-game injury/lineup edges.
+// Previously 2–8hr ignored the most profitable window (0–2hr pre-game) per Networked CLV study.
+// New range: 30min–8hr. Combined with the tighten-on-game-time freshness gate, this catches
+// pre-game lineup announcements + scratches that move Pinnacle 4–8pp before Kalshi reprices.
+const MIN_BEFORE_GAME_MS = 30 * 60 * 1000;       // earliest: 30 min pre-game
+const MAX_BEFORE_GAME_MS = 8 * 60 * 60 * 1000;   // latest: 8 hr pre-game
+const FETCH_TIMEOUT     = 10_000;
+const DEDUP_MS          = 60 * 60 * 1000;   // 1 hr dedup per market
+
+/** Kalshi series to poll → The Odds API sport_key mapping */
+const SPORT_MAP: Record<string, string> = {
+  KXNFLGAME:  'americanfootball_nfl',
+  KXNFL:      'americanfootball_nfl',
+  KXNBAGAME:  'basketball_nba',
+  KXNBA:      'basketball_nba',
+  KXMLBGAME:  'baseball_mlb',
+  KXMLB:      'baseball_mlb',
+  KXNHLGAME:  'icehockey_nhl',
+  KXNHL:      'icehockey_nhl',
+};
+
+const ALL_SERIES = Object.keys(SPORT_MAP);
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+interface KalshiSportsMarket {
+  ticker: string;
+  eventTicker: string;
+  series: string;
+  title: string;
+  /** UTC ms when the game starts (occurrence_datetime) */
+  gameStartMs: number;
+  /** UTC ms when the market closes */
+  closesAtMs: number;
+  yesBid?: number;
+  yesAsk?: number;
+  noBid?: number;
+  noAsk?: number;
+  liquidityUsd?: number;
+  marketDbId?: string;
+  lastOrderAt?: number;
+  /** Normalised team name from the title, e.g. "Kansas City" */
+  teamName?: string;
+}
+
+interface PinnacleGame {
+  homeTeam: string;
+  awayTeam: string;
+  commenceTimeMs: number;
+  homeNoVigProb: number;
+  awayNoVigProb: number;
+  /** raw key from The Odds API */
+  sportKey: string;
+  /** 2026-05-23 v3: Pinnacle bookmaker.last_update for freshness check */
+  pinnacleLastUpdateMs: number;
+}
+
+/** Pinnacle odds cache per sport_key */
+interface OddsCache {
+  games: PinnacleGame[];
+  fetchedAtMs: number;
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+const parseD = (v: any, div = 1): number | undefined =>
+  v != null && v !== '' ? parseFloat(v) / div : undefined;
+
+/**
+ * Devig two implied probabilities using the standard normalisation method.
+ * Returns [prob1, prob2] summing to 1.
+ */
+function devig(decimalOdds1: number, decimalOdds2: number): [number, number] {
+  const p1 = 1 / decimalOdds1;
+  const p2 = 1 / decimalOdds2;
+  const total = p1 + p2;
+  return [p1 / total, p2 / total];
+}
+
+/**
+ * American odds → decimal odds.
+ * +150 → 2.50, -110 → 1.909…
+ */
+function americanToDecimal(american: number): number {
+  if (american > 0) return (american / 100) + 1;
+  return (100 / Math.abs(american)) + 1;
+}
+
+/**
+ * Loose team-name matcher. Returns true if the shortName fragment
+ * appears inside the fullName, case-insensitive.
+ * Also maps common 3-letter abbreviations to city/nickname strings.
+ *
+ * Built as an array of tuples (not object literal) to allow the same
+ * abbreviation to map to multiple teams across different sports.
+ * teamAliases() merges all aliases for a given abbrev into one array.
+ */
+const ABBREV_ENTRIES: [string, string[]][] = [
+  // NFL
+  ['KC',  ['kansas city', 'chiefs']],
+  ['DEN', ['denver', 'broncos']],
+  ['DAL', ['dallas', 'cowboys']],
+  ['NYG', ['new york g', 'giants', 'ny giants']],
+  ['WAS', ['washington', 'commanders']],
+  ['PHI', ['philadelphia', 'eagles']],
+  ['NE',  ['new england', 'patriots']],
+  ['BUF', ['buffalo', 'bills']],
+  ['MIA', ['miami', 'dolphins']],
+  ['NYJ', ['new york j', 'jets', 'ny jets']],
+  ['BAL', ['baltimore', 'ravens']],
+  ['PIT', ['pittsburgh', 'steelers']],
+  ['CLE', ['cleveland', 'browns']],
+  ['CIN', ['cincinnati', 'bengals']],
+  ['HOU', ['houston', 'texans']],
+  ['IND', ['indianapolis', 'colts']],
+  ['JAC', ['jacksonville', 'jaguars']],
+  ['JAX', ['jacksonville', 'jaguars']],
+  ['TEN', ['tennessee', 'titans']],
+  ['LAC', ['los angeles c', 'chargers', 'la chargers']],
+  ['LV',  ['las vegas', 'raiders']],
+  ['LVR', ['las vegas', 'raiders']],
+  ['OAK', ['las vegas', 'raiders', 'oakland']],
+  ['SEA', ['seattle', 'seahawks']],
+  ['LAR', ['los angeles r', 'rams', 'la rams']],
+  ['ARI', ['arizona', 'cardinals']],
+  ['SF',  ['san francisco', '49ers']],
+  ['ATL', ['atlanta', 'falcons']],
+  ['CAR', ['carolina', 'panthers']],
+  ['NO',  ['new orleans', 'saints']],
+  ['TB',  ['tampa bay', 'buccaneers']],
+  ['GB',  ['green bay', 'packers']],
+  ['MIN', ['minnesota', 'vikings']],
+  ['CHI', ['chicago', 'bears']],
+  ['DET', ['detroit', 'lions']],
+  // NBA
+  ['BOS', ['boston', 'celtics']],
+  ['MIL', ['milwaukee', 'bucks']],
+  ['CLE', ['cleveland', 'cavaliers']],
+  ['ORL', ['orlando', 'magic']],
+  ['ATL', ['atlanta', 'hawks']],
+  ['MIA', ['miami', 'heat']],
+  ['NYK', ['new york', 'knicks']],
+  ['BKN', ['brooklyn', 'nets']],
+  ['PHI', ['philadelphia', '76ers', 'sixers']],
+  ['CHI', ['chicago', 'bulls']],
+  ['IND', ['indiana', 'pacers']],
+  ['DET', ['detroit', 'pistons']],
+  ['TOR', ['toronto', 'raptors']],
+  ['CHA', ['charlotte', 'hornets']],
+  ['WAS', ['washington', 'wizards']],
+  ['GSW', ['golden state', 'warriors']],
+  ['LAL', ['los angeles l', 'lakers', 'la lakers']],
+  ['LAC', ['los angeles c', 'clippers', 'la clippers']],
+  ['PHX', ['phoenix', 'suns']],
+  ['SAC', ['sacramento', 'kings']],
+  ['UTA', ['utah', 'jazz']],
+  ['DEN', ['denver', 'nuggets']],
+  ['MIN', ['minnesota', 'timberwolves']],
+  ['OKC', ['oklahoma', 'thunder']],
+  ['POR', ['portland', 'trail blazers']],
+  ['MEM', ['memphis', 'grizzlies']],
+  ['NOP', ['new orleans', 'pelicans']],
+  ['SAS', ['san antonio', 'spurs']],
+  ['HOU', ['houston', 'rockets']],
+  ['DAL', ['dallas', 'mavericks']],
+  // MLB
+  ['NYY', ['new york y', 'yankees', 'ny yankees']],
+  ['BOS', ['boston', 'red sox']],
+  ['TBR', ['tampa bay', 'rays']],
+  ['BAL', ['baltimore', 'orioles']],
+  ['TOR', ['toronto', 'blue jays']],
+  ['CWS', ['chicago w', 'white sox']],
+  ['DET', ['detroit', 'tigers']],
+  ['CLE', ['cleveland', 'guardians']],
+  ['MIN', ['minnesota', 'twins']],
+  ['KCR', ['kansas city', 'royals']],
+  ['HOU', ['houston', 'astros']],
+  ['TEX', ['texas', 'rangers']],
+  ['LAA', ['los angeles a', 'angels', 'la angels']],
+  ['OAK', ['oakland', 'athletics']],
+  ['SEA', ['seattle', 'mariners']],
+  ['NYM', ['new york m', 'mets', 'ny mets']],
+  ['ATL', ['atlanta', 'braves']],
+  ['MIA', ['miami', 'marlins']],
+  ['PHI', ['philadelphia', 'phillies']],
+  ['WSN', ['washington', 'nationals']],
+  ['CHC', ['chicago c', 'cubs']],
+  ['MIL', ['milwaukee', 'brewers']],
+  ['CIN', ['cincinnati', 'reds']],
+  ['STL', ['st. louis', 'cardinals']],
+  ['PIT', ['pittsburgh', 'pirates']],
+  ['LAD', ['los angeles d', 'dodgers', 'la dodgers']],
+  ['SFG', ['san francisco', 'giants']],
+  ['SDG', ['san diego', 'padres']],
+  ['COL', ['colorado', 'rockies']],
+  ['ARI', ['arizona', 'diamondbacks']],
+  // NHL
+  ['BOS', ['boston', 'bruins']],
+  ['BUF', ['buffalo', 'sabres']],
+  ['DET', ['detroit', 'red wings']],
+  ['FLA', ['florida', 'panthers']],
+  ['MTL', ['montreal', 'canadiens']],
+  ['OTT', ['ottawa', 'senators']],
+  ['TBL', ['tampa bay', 'lightning']],
+  ['TOR', ['toronto', 'maple leafs']],
+  ['CAR', ['carolina', 'hurricanes']],
+  ['CBJ', ['columbus', 'blue jackets']],
+  ['NJD', ['new jersey', 'devils']],
+  ['NYI', ['new york i', 'islanders', 'ny islanders']],
+  ['NYR', ['new york r', 'rangers', 'ny rangers']],
+  ['PHI', ['philadelphia', 'flyers']],
+  ['PIT', ['pittsburgh', 'penguins']],
+  ['WPG', ['winnipeg', 'jets']],
+  ['MIN', ['minnesota', 'wild']],
+  ['COL', ['colorado', 'avalanche']],
+  ['NSH', ['nashville', 'predators']],
+  ['STL', ['st. louis', 'blues']],
+  ['CGY', ['calgary', 'flames']],
+  ['EDM', ['edmonton', 'oilers']],
+  ['SJS', ['san jose', 'sharks']],
+  ['VAN', ['vancouver', 'canucks']],
+  ['ANA', ['anaheim', 'ducks']],
+  ['ARI', ['arizona', 'coyotes']],
+  ['DAL', ['dallas', 'stars']],
+  ['LAK', ['los angeles k', 'kings', 'la kings']],
+  ['VGK', ['vegas', 'golden knights']],
+  ['SEA', ['seattle', 'kraken']],
+  ['WSH', ['washington', 'capitals']],
+];
+
+/** Merge all alias arrays for a given abbreviation (handles multi-sport duplicates). */
+function teamAliases(abbrev: string): string[] {
+  const result: string[] = [];
+  for (const [key, aliases] of ABBREV_ENTRIES) {
+    if (key === abbrev) result.push(...aliases);
+  }
+  return result;
+}
+
+function teamMatches(kalshiTitle: string, pinnacleTeam: string): boolean {
+  const kl = kalshiTitle.toLowerCase();
+  const pl = pinnacleTeam.toLowerCase();
+
+  // Direct substring match
+  if (kl.includes(pl) || pl.includes(kl)) return true;
+
+  // Try abbreviation lookup: extract last word of kalshiTitle (often the team abbrev)
+  const words = kl.split(/\s+/);
+  const lastWord = words[words.length - 1].toUpperCase();
+  for (const alias of teamAliases(lastWord)) {
+    if (pl.includes(alias)) return true;
+  }
+
+  // Try first word too (e.g. "KC" in "Will KC win")
+  const firstWord = words[0].toUpperCase();
+  for (const alias of teamAliases(firstWord)) {
+    if (pl.includes(alias)) return true;
+  }
+
+  return false;
+}
+
+// ─── Strategy class ───────────────────────────────────────────────────────────
+
+export class SportsCLVStrategy {
+  readonly name = 'sports_clv';
+
+  private markets    = new Map<string, KalshiSportsMarket>();
+  private oddsCache  = new Map<string, OddsCache>();          // sport_key → cache
+  // v3.2: openOrders extended with chase metadata. Each entry now tracks the
+  // original limit price and posted timestamp so the chase loop can detect
+  // unfilled orders and re-post at the new bid when edge still exists.
+  private openOrders = new Map<string, {
+    ticker: string;
+    gameStartMs: number;
+    side: 'yes' | 'no';
+    eventTicker: string;
+    limitPrice: number;
+    sizeContracts: number;
+    postedAtMs: number;
+    chaseCount: number;  // capped to prevent infinite reposting
+    marketDbId?: string;
+  }>();
+
+  private opportunitiesSeen = 0;
+  private fires             = 0;
+  private oddsApiQuotaUsed  = 0;
+  // 2026-05-23 v2 BUG FIX: per-event dedup. Each MLB game has TWO Kalshi tickers
+  // (one per team-as-winner) — e.g. KXMLBGAME-...CWSSF-CWS and KXMLBGAME-...CWSSF-SF.
+  // Without this map, when Pinnacle disagrees with the market, BOTH tickers fire
+  // — buying the same outcome twice (doubled exposure + doubled fees). After a
+  // fire, this map blocks any other ticker on the same eventTicker for 6 hours.
+  private firedEventTickers = new Map<string, number>();  // eventTicker → fire timestamp ms
+  private readonly FIRED_EVENT_TTL_MS = 6 * 60 * 60 * 1000;  // 6h — longer than any MLB/NBA/NHL game
+
+  /** Set to false if ODDS_API_KEY is missing — strategy no-ops */
+  private enabled = true;
+  private apiKey  = '';
+
+  constructor(private kalshi: KalshiConnector) {}
+
+  async start(): Promise<void> {
+    const key = process.env.ODDS_API_KEY;
+    if (!key) {
+      log.warn('ODDS_API_KEY not set — SportsCLV strategy is disabled. Set ODDS_API_KEY to enable.');
+      this.enabled = false;
+      // Still run heartbeat so monitoring knows the strategy is alive but disabled
+      setInterval(() => this.heartbeat(), HEARTBEAT_MS);
+      return;
+    }
+    this.apiKey = key;
+
+    log.info('sports_clv strategy starting');
+    // SEQUENTIAL boot: discovery MUST complete before refreshOdds, or refreshOdds
+    // sees empty markets and skips, then waits 15 min for next attempt.
+    await this.discoverMarkets();
+    await this.refreshOdds();
+
+    // 2026-05-23 v2 BUG FIX: hydrate firedEventTickers from EXISTING resting orders on Kalshi.
+    // Without this, a restart wipes the in-memory dedup map — the bot re-fires the same
+    // sibling tickers it already has open orders on, causing duplicate exposure.
+    // (The 16:53 → 16:57 duplicate fire happened exactly because of this on the env-update restart.)
+    try {
+      const openOrders = await this.kalshi.getOpenOrders();
+      let hydrated = 0;
+      const orderTs = Date.now();
+      for (const o of openOrders ?? []) {
+        const ticker = (o as any).ticker || (o as any).market_ticker;
+        if (!ticker) continue;
+        // Look up which event this ticker belongs to (markets are already discovered above)
+        const m = this.markets.get(ticker);
+        if (!m) continue;
+        // Stamp both maps so the dedup + sibling-block both apply
+        m.lastOrderAt = orderTs;
+        this.firedEventTickers.set(m.eventTicker, orderTs);
+        hydrated++;
+      }
+      if (hydrated > 0) {
+        log.info({ restingOrders: openOrders.length, hydrated }, 'sports_clv: hydrated firedEventTickers from open orders');
+      }
+    } catch (e: any) {
+      log.warn({ err: e.message }, 'sports_clv: failed to hydrate from open orders — continuing');
+    }
+
+    await this.evaluateAll();
+
+    // Discovery + odds use shared POLL_MS (1 or 5 min). Evaluate runs more frequently
+    // since it's local computation — catches divergences as soon as Pinnacle cache refreshes.
+    setInterval(() => this.discoverMarkets(),  POLL_MS);
+    setInterval(() => this.refreshOdds(),      POLL_MS);
+    setInterval(() => this.evaluateAll(),      KALSHI_REFRESH_MS);
+    setInterval(() => this.cancelPreGame(),    5 * 60 * 1000);  // check every 5 min
+    setInterval(() => this.chaseStaleMakerOrders(), 60 * 1000);  // v3.2: chase unfilled
+    setInterval(() => this.heartbeat(),        HEARTBEAT_MS);
+
+    log.info({ tracked: this.markets.size }, 'Sports CLV strategy running');
+  }
+
+  // ─── Market discovery ────────────────────────────────────────────────────────
+
+  private async discoverMarkets(): Promise<void> {
+    if (!this.enabled) return;
+    const now = Date.now();
+
+    // Prune expired markets
+    for (const [t, m] of this.markets) {
+      if (m.closesAtMs < now) this.markets.delete(t);
+    }
+
+    let added = 0;
+    for (const series of ALL_SERIES) {
+      try {
+        const { data } = await axios.get(
+          'https://api.elections.kalshi.com/trade-api/v2/markets',
+          { params: { series_ticker: series, status: 'open', limit: 200 }, timeout: FETCH_TIMEOUT }
+        );
+        for (const m of (data?.markets ?? []) as any[]) {
+          if (this.markets.has(m.ticker)) continue;
+          const parsed = this.parseMarket(m, series);
+          if (parsed) { this.markets.set(m.ticker, parsed); added++; }
+        }
+      } catch (e: any) {
+        if (!String(e.message ?? '').includes('429'))
+          log.warn({ series, err: e.message }, 'discoverMarkets series failed');
+      }
+      await new Promise((r) => setTimeout(r, 200)); // rate-limit safety
+    }
+
+    if (added > 0) log.info({ added, tracked: this.markets.size }, 'Sports CLV: discovered markets');
+  }
+
+  private parseMarket(m: any, series: string): KalshiSportsMarket | null {
+    const closeMs = m.close_time ? new Date(m.close_time).getTime() : 0;
+    if (!closeMs || closeMs < Date.now()) return null;
+
+    // Game start: occurrence_datetime is the canonical field on Kalshi game markets.
+    // Fall back to close_time - 2hr heuristic if absent.
+    const gameStartMs = m.occurrence_datetime
+      ? new Date(m.occurrence_datetime).getTime()
+      : closeMs - 2 * 60 * 60 * 1000;
+
+    // Extract team name: for KXNFLGAME/game markets, the last segment of the ticker
+    // (after the final '-') is the 2-3 letter team abbrev (e.g. KC, DEN).
+    const tickerParts = (m.ticker as string).split('-');
+    const teamAbbrev  = tickerParts[tickerParts.length - 1];
+
+    return {
+      ticker:       m.ticker,
+      series,
+      title:        m.title ?? m.ticker,
+      eventTicker:  m.event_ticker ?? tickerParts.slice(0, -1).join('-'),
+      closesAtMs:   closeMs,
+      gameStartMs,
+      yesBid:  parseD(m.yes_bid_dollars),
+      yesAsk:  parseD(m.yes_ask_dollars),
+      noBid:   parseD(m.no_bid_dollars),
+      noAsk:   parseD(m.no_ask_dollars),
+      liquidityUsd: parseD(m.liquidity_dollars),
+      teamName: teamAbbrev,
+    };
+  }
+
+  private async refreshBook(m: KalshiSportsMarket): Promise<void> {
+    try {
+      const { data } = await axios.get(
+        `https://api.elections.kalshi.com/trade-api/v2/markets/${m.ticker}`,
+        { timeout: FETCH_TIMEOUT }
+      );
+      const mk = data?.market;
+      if (!mk) return;
+      m.yesBid = parseD(mk.yes_bid_dollars);
+      m.yesAsk = parseD(mk.yes_ask_dollars);
+      m.noBid  = parseD(mk.no_bid_dollars);
+      m.noAsk  = parseD(mk.no_ask_dollars);
+      m.liquidityUsd = parseD(mk.liquidity_dollars) ?? m.liquidityUsd;
+    } catch { /* stale quotes — skip */ }
+  }
+
+  // ─── Odds API ────────────────────────────────────────────────────────────────
+
+  /**
+   * Fetch Pinnacle odds for each sport that currently has open Kalshi markets.
+   * Skips a sport if its cache is <15 min old (POLL_MS aligns naturally).
+   */
+  private async refreshOdds(): Promise<void> {
+    if (!this.enabled) return;
+
+    // Quota conservation: only fetch a sport's odds if at least one Kalshi market
+    // for that sport is within the trading window (2–6 hr before game start).
+    // This caps us at ~3 calls/sport/day instead of 96, keeping us well under
+    // the free tier's 500 req/month.
+    const now = Date.now();
+    const activeSportKeys = new Set<string>();
+    for (const m of this.markets.values()) {
+      const sportKey = SPORT_MAP[m.series];
+      if (!sportKey || !m.gameStartMs) continue;
+      const msToGame = m.gameStartMs - now;
+      // Allow a slightly wider pre-window (up to 8 hr) so we have fresh odds when
+      // the 6-hour evaluate window opens.
+      if (msToGame >= MIN_BEFORE_GAME_MS - POLL_MS && msToGame <= MAX_BEFORE_GAME_MS + 2 * 60 * 60 * 1000) {
+        activeSportKeys.add(sportKey);
+      }
+    }
+
+    if (activeSportKeys.size === 0) {
+      // INFO not debug — we need to see this to debug zero-fires issues.
+      log.info({ tracked: this.markets.size }, 'sports_clv: no markets in 2–8hr pre-game window — skipping Odds API call');
+      return;
+    }
+    log.info({ activeSportKeys: [...activeSportKeys], tracked: this.markets.size }, 'sports_clv: active pre-game window detected, fetching Pinnacle');
+
+    for (const sportKey of activeSportKeys) {
+      const cached = this.oddsCache.get(sportKey);
+      if (cached && Date.now() - cached.fetchedAtMs < POLL_MS) continue; // cache hit
+
+      try {
+        log.info({ sportKey }, 'sports_clv: fetching Pinnacle odds');
+        const { data } = await axios.get(
+          `https://api.the-odds-api.com/v4/sports/${sportKey}/odds`,
+          {
+            params: {
+              apiKey:      this.apiKey,
+              regions:     'us',
+              markets:     'h2h',
+              bookmakers:  'pinnacle',
+              oddsFormat:  'american',
+            },
+            timeout: FETCH_TIMEOUT,
+          }
+        );
+        this.oddsApiQuotaUsed++;
+
+        const games = this.parsePinnacleResponse(data, sportKey);
+        this.oddsCache.set(sportKey, { games, fetchedAtMs: Date.now() });
+        log.info({ sportKey, games: games.length, quotaUsed: this.oddsApiQuotaUsed }, 'Pinnacle odds refreshed');
+      } catch (e: any) {
+        log.warn({ sportKey, err: e.message }, 'Odds API fetch failed');
+        // Keep stale cache — don't delete
+      }
+
+      await new Promise((r) => setTimeout(r, 500)); // polite delay between sport calls
+    }
+  }
+
+  private parsePinnacleResponse(data: any[], sportKey: string): PinnacleGame[] {
+    if (!Array.isArray(data)) return [];
+    const games: PinnacleGame[] = [];
+
+    for (const game of data) {
+      const commenceTimeMs = game.commence_time
+        ? new Date(game.commence_time).getTime()
+        : 0;
+      if (!commenceTimeMs) continue;
+
+      const pinnacleBook = (game.bookmakers ?? []).find(
+        (b: any) => b.key === 'pinnacle'
+      );
+      if (!pinnacleBook) continue;
+
+      const h2h = (pinnacleBook.markets ?? []).find(
+        (mk: any) => mk.key === 'h2h'
+      );
+      if (!h2h || !Array.isArray(h2h.outcomes) || h2h.outcomes.length < 2) continue;
+
+      // 2026-05-23 v2 CRITICAL BUG FIX: The Odds API does NOT guarantee that
+      // outcomes[0] = home team. Empirically verified May 2026: in our sample,
+      // some games had outcomes[0]=home, others had outcomes[0]=away. Previously
+      // we blindly assigned prob0=homeNoVigProb, which inverted probabilities for
+      // any game where outcomes were ordered (away, home). This caused fake huge
+      // divergences (16–25pp) that were just our own probabilities being mirrored.
+      // FIX: match outcomes to home/away by team NAME, not by array position.
+      const o0 = h2h.outcomes[0];
+      const o1 = h2h.outcomes[1];
+
+      if (!o0?.name || !o1?.name || o0.price == null || o1.price == null) continue;
+
+      const dec0 = americanToDecimal(Number(o0.price));
+      const dec1 = americanToDecimal(Number(o1.price));
+
+      if (!isFinite(dec0) || !isFinite(dec1) || dec0 <= 1 || dec1 <= 1) continue;
+
+      const [prob0, prob1] = devig(dec0, dec1);
+
+      // Determine which outcome is home vs away by matching .name to game.home_team / game.away_team.
+      // Fall back to position-based (legacy) only if names don't match either field.
+      const homeName = game.home_team;
+      const awayName = game.away_team;
+      let homeProb: number, awayProb: number;
+      if (o0.name === homeName && o1.name === awayName) {
+        homeProb = prob0; awayProb = prob1;
+      } else if (o0.name === awayName && o1.name === homeName) {
+        homeProb = prob1; awayProb = prob0;
+      } else {
+        // Names don't match either field — skip rather than guess.
+        log.warn({ home: homeName, away: awayName, o0: o0.name, o1: o1.name }, 'Pinnacle outcome names do not match home/away — skipping game');
+        continue;
+      }
+
+      // 2026-05-23 v3: track Pinnacle bookmaker.last_update for staleness gate
+      const pinnacleLastUpdateMs = pinnacleBook.last_update
+        ? new Date(pinnacleBook.last_update).getTime()
+        : Date.now();
+
+      games.push({
+        homeTeam:        homeName ?? o0.name,
+        awayTeam:        awayName ?? o1.name,
+        commenceTimeMs,
+        homeNoVigProb:   homeProb,
+        awayNoVigProb:   awayProb,
+        sportKey,
+        pinnacleLastUpdateMs,
+      });
+    }
+
+    return games;
+  }
+
+  // ─── Matching & evaluation ────────────────────────────────────────────────────
+
+  /**
+   * Match a Kalshi market to a Pinnacle game, returning the no-vig probability
+   * for the team this Kalshi market resolves YES on, plus the freshness timestamp.
+   * 2026-05-23 v3: returns { prob, pinnacleAgeSec } so caller can apply staleness gate.
+   */
+  private matchMarketToGame(m: KalshiSportsMarket): { prob: number; pinnacleAgeSec: number } | null {
+    const sportKey = SPORT_MAP[m.series];
+    if (!sportKey) return null;
+
+    const cache = this.oddsCache.get(sportKey);
+    if (!cache || cache.games.length === 0) return null;
+
+    const title = m.title ?? '';
+    const now = Date.now();
+
+    const ageSec = (g: PinnacleGame) => (now - g.pinnacleLastUpdateMs) / 1000;
+
+    for (const game of cache.games) {
+      // Game time must be within 3 hours of Kalshi's occurrence_datetime (clock drift guard)
+      const timeDiff = Math.abs(game.commenceTimeMs - m.gameStartMs);
+      if (timeDiff > 3 * 60 * 60 * 1000) continue; // >3hr diff = different game
+
+      // Try to match home team first
+      if (teamMatches(title, game.homeTeam)) {
+        return { prob: game.homeNoVigProb, pinnacleAgeSec: ageSec(game) };
+      }
+      // Try away team
+      if (teamMatches(title, game.awayTeam)) {
+        return { prob: game.awayNoVigProb, pinnacleAgeSec: ageSec(game) };
+      }
+
+      // Fallback: try teamName abbrev field
+      if (m.teamName) {
+        const aliases = teamAliases(m.teamName.toUpperCase());
+        if (aliases.length > 0) {
+          for (const alias of aliases) {
+            if (game.homeTeam.toLowerCase().includes(alias)) return { prob: game.homeNoVigProb, pinnacleAgeSec: ageSec(game) };
+            if (game.awayTeam.toLowerCase().includes(alias)) return { prob: game.awayNoVigProb, pinnacleAgeSec: ageSec(game) };
+          }
+        }
+      }
+    }
+
+    return null; // no confident match
+  }
+
+  private async evaluateAll(): Promise<void> {
+    if (!this.enabled) return;
+    const now = Date.now();
+
+    for (const m of this.markets.values()) {
+      const untilGame = m.gameStartMs - now;
+
+      // Skip: outside 2-6 hr window
+      if (untilGame < MIN_BEFORE_GAME_MS || untilGame > MAX_BEFORE_GAME_MS) continue;
+
+      await this.refreshBook(m);
+      await this.evaluateMarket(m);
+      await new Promise((r) => setTimeout(r, 100));
+    }
+  }
+
+  private async evaluateMarket(m: KalshiSportsMarket): Promise<void> {
+    if (m.yesBid == null || m.yesAsk == null) return;
+
+    const match = this.matchMarketToGame(m);
+    if (match === null) return; // no Pinnacle match
+    const noVigProb = match.prob;
+
+    const marketMid  = (m.yesBid + m.yesAsk) / 2;
+    const divergence = noVigProb - marketMid;
+    const absDiv     = Math.abs(divergence);
+
+    if (absDiv < MIN_DIV) return;
+
+    // 2026-05-23 v3 (strategy_v3_optimization.pplx.md): REPLACED 5pp ceiling with
+    // Pinnacle freshness gate. The 5pp ceiling was blocking real divergences caused
+    // by late injury news or lineup changes Kalshi hasn't repriced yet — exactly
+    // the opportunities the strategy should catch.
+    // New rule: trust any divergence up to 15pp IF Pinnacle data is <10min old.
+    //   - If Pinnacle data is stale (>600s old): skip (Pinnacle hasn't seen the news yet)
+    //   - Beyond 15pp: still skip (real-world Pinnacle vs Kalshi rarely exceeds this)
+    // v3.1: Pinnacle freshness gate tightens as we approach game time.
+    // Rationale: in the 30 minutes before first pitch, injury news + lineup confirmations
+    // create rapid line moves. Stale Pinnacle data (>5min) during this window is much
+    // more likely to be wrong. Use 600s default, 300s in the 30min-pre-game window.
+    const minToGame = (m.gameStartMs - Date.now()) / 60_000;
+    const tightenWindow = minToGame > 0 && minToGame < 30;
+    const PINNACLE_MAX_AGE_SECONDS = tightenWindow
+      ? parseInt(process.env.PINNACLE_MAX_AGE_SECONDS_TIGHT ?? '300', 10)
+      : parseInt(process.env.PINNACLE_MAX_AGE_SECONDS ?? '600', 10);
+    const MAX_DIV_CEILING = 0.15;
+    if (absDiv > MAX_DIV_CEILING) {
+      log.info({ ticker: m.ticker, divergence: divergence.toFixed(3), noVigProb: noVigProb.toFixed(3), marketMid: marketMid.toFixed(3) }, 'sports SKIP: divergence >15pp — hard ceiling (likely match error)');
+      return;
+    }
+    if (match.pinnacleAgeSec > PINNACLE_MAX_AGE_SECONDS) {
+      log.info({ ticker: m.ticker, ageSec: match.pinnacleAgeSec.toFixed(0), divergence: divergence.toFixed(3) }, 'sports SKIP: Pinnacle data >10min stale');
+      return;
+    }
+
+    // v3 favorite-longshot filter (GWU paper): block YES bets where Pinnacle no-vig > $0.80.
+    // At those extremes, team-matching noise is highest and edge is lowest.
+    if (divergence > 0 && noVigProb > 0.80) {
+      log.info({ ticker: m.ticker, noVigProb: noVigProb.toFixed(3) }, 'sports SKIP: YES bet on >0.80 Pinnacle favorite (v3 longshot filter)');
+      return;
+    }
+
+    this.opportunitiesSeen++;
+    const now = Date.now();
+
+    // 2026-05-23 v2 BUG FIX: per-event dedup across both tickers of the same game.
+    // Prevents doubling exposure when Pinnacle and Kalshi disagree on a game.
+    const recentFire = this.firedEventTickers.get(m.eventTicker);
+    if (recentFire && now - recentFire < this.FIRED_EVENT_TTL_MS) {
+      log.info({ ticker: m.ticker, eventTicker: m.eventTicker, secAgo: ((now - recentFire)/1000).toFixed(0) }, 'sports SKIP: event already fired (per-event dedup)');
+      return;
+    }
+
+    if (m.lastOrderAt && now - m.lastOrderAt < DEDUP_MS) {
+      log.info({ ticker: m.ticker, mtSinceLast: ((now - m.lastOrderAt)/1000).toFixed(0) }, 'sports SKIP: dedup window');
+      return;
+    }
+
+    // Determine side and maker entry price
+    let side: 'yes' | 'no';
+    let entryPrice: number;
+
+    // v3.6 (NO-only recalibration): 44h validation showed YES bets at 20% WR / -$10.32,
+    // NO bets at 50% WR / +$11.81. Structural reason: Kalshi retail systematically
+    // overprices YES on favorite teams (favorite-longshot bias). Selling NO captures
+    // the overpricing; buying YES catches the falling knife. Gated by env so easy to revert.
+    if (NO_ONLY && divergence > 0) {
+      log.info({ ticker: m.ticker, divergence: divergence.toFixed(3) }, 'sports SKIP v3.6: NO-only mode, skipping YES bet');
+      return;
+    }
+
+    // v3.5 (sports fill fix): when bid-ask spread is wide, post HALFWAY between
+    // bid and our fair price instead of at best bid. Previous logic gave 0/17 fills
+    // in 18 hours.
+    if (divergence > 0) {
+      side = 'yes';
+      const yesAsk = m.yesAsk ?? 1.0;
+      const yesBid = m.yesBid;
+      const fair = noVigProb;  // Pinnacle's no-vig probability is our fair value
+      const yesSpread = yesAsk - yesBid;
+      if (yesSpread > 0.03) {
+        // Wide spread: bid halfway between current bid and fair value, capped 2¢ below ask
+        entryPrice = Math.min(yesBid + yesSpread / 2, fair - 0.02, yesAsk - 0.02);
+        entryPrice = Math.max(entryPrice, yesBid + 0.01);  // always >= bid+1¢
+      } else {
+        entryPrice = yesBid;
+      }
+    } else {
+      side = 'no';
+      const noBid = m.noBid ?? (m.yesAsk != null ? 1 - m.yesAsk : null);
+      const noAsk = m.noAsk ?? (m.yesBid != null ? 1 - m.yesBid : null);
+      if (noBid == null || noBid <= 0 || noAsk == null) return;
+      const fair = 1 - noVigProb;  // NO fair = 1 - Pinnacle YES no-vig
+      const noSpread = noAsk - noBid;
+      if (noSpread > 0.03) {
+        entryPrice = Math.min(noBid + noSpread / 2, fair - 0.02, noAsk - 0.02);
+        entryPrice = Math.max(entryPrice, noBid + 0.01);
+      } else {
+        entryPrice = noBid;
+      }
+    }
+
+    // 2026-05-23 v2 (kalshi_crypto_model_v2.pplx.md): price band widened to $0.25–$0.80.
+    // Old floor of $0.50 was over-restrictive — Becker 2026 shows MAKER orders at $0.25–$0.50
+    // are positive-EV when there's a real Pinnacle vs Kalshi divergence (we ARE the maker here).
+    // The GWU "underdogs lose" finding applied to TAKERS — we post limits, so the structural
+    // edge flips. Above $0.80 still rejected (payout asymmetry collapses maker edge on favorites).
+    if (entryPrice < 0.25 || entryPrice > 0.80) {
+      log.info({ ticker: m.ticker, entryPrice: entryPrice?.toFixed(2), side, marketMid: marketMid.toFixed(2), divergence: divergence.toFixed(3) }, 'sports SKIP: price outside band');
+      return;
+    }
+
+    // v3.6: skip toss-up band ($0.45-$0.55) where edge is weakest (WR 28.6%, net -$6.51 in validation)
+    if (SKIP_TOSSUP_BAND && entryPrice >= 0.45 && entryPrice <= 0.55) {
+      log.info({ ticker: m.ticker, entryPrice: entryPrice.toFixed(2) }, 'sports SKIP v3.6: toss-up band ($0.45-$0.55) disabled');
+      return;
+    }
+
+    const risk   = getRiskEngine();
+
+    // v3.7 bankroll hard-stop: pause new trades if account cash dropped below floor.
+    // Protects against runaway loss streaks at high Kelly settings.
+    if (BANKROLL_HARD_STOP > 0 && risk.getStats().bankroll < BANKROLL_HARD_STOP) {
+      log.warn({ ticker: m.ticker, bankroll: risk.getStats().bankroll, floor: BANKROLL_HARD_STOP }, '🛑 sports SKIP v3.7: bankroll below hard-stop floor');
+      return;
+    }
+    const kelly  = risk.kellySize(noVigProb, marketMid, side.toUpperCase() as 'YES' | 'NO');
+    if (kelly < 0.001) return;
+
+    const sizeUsd = Math.min(kelly * KELLY_MULT * risk.getStats().bankroll, MAX_TRADE_USD);
+    // 2026-05-23 v2: Kalshi MLB single-game markets report liquidity_dollars=0 even though
+    // the actual orderbook has $50–$200 depth at top of book. The MIN_LIQUIDITY_USD=$100
+    // gate was set for political/election markets and was blocking 100% of sports trades.
+    // Sports positions HOLD TO SETTLE (no active exit), so exit-liquidity doesn't apply.
+    // Pass `undefined` when Kalshi reports 0/null to skip the gate. Pinnacle CLV signal
+    // ensures we only fire when there's real maker fill quality.
+    const liqForRisk = (m.liquidityUsd != null && m.liquidityUsd > 0) ? m.liquidityUsd : undefined;
+    // Sanity: verify there's a real bid/ask to post against (book is genuinely not empty)
+    if (m.yesBid == null || m.yesAsk == null || m.yesBid <= 0 || m.yesAsk <= 0) {
+      log.info({ ticker: m.ticker, yesBid: m.yesBid, yesAsk: m.yesAsk }, 'sports SKIP: no live bid/ask');
+      return;
+    }
+    const check   = risk.canTrade(this.name, m.ticker, sizeUsd, {
+      closesAt:     new Date(m.closesAtMs),
+      eventTicker:  m.eventTicker,
+      fractional:   false,
+      liquidityUsd: liqForRisk,
+    });
+
+    if (!check.allowed) {
+      log.info({ ticker: m.ticker, reason: check.reason, sizeUsd: sizeUsd.toFixed(2) }, 'sports SKIP: risk engine blocked');
+      return;
+    }
+
+    const sizeContracts = Math.floor(check.sizeUsd / entryPrice);
+    if (sizeContracts < 1) {
+      log.info({ ticker: m.ticker, sizeUsd: check.sizeUsd.toFixed(2), entryPrice: entryPrice.toFixed(2) }, 'sports SKIP: sizeContracts <1');
+      return;
+    }
+
+    m.lastOrderAt = now;
+
+    // Upsert market record
+    if (!m.marketDbId) {
+      try {
+        const id = await upsertMarket({
+          platform:   'kalshi',
+          external_id: m.ticker,
+          question:   m.title,
+          category:   'sports',
+          outcome:    side === 'yes' ? 'YES' : 'NO',
+          closes_at:  new Date(m.closesAtMs),
+        });
+        if (id) m.marketDbId = id;
+      } catch (e: any) { log.debug({ err: e.message }, 'upsertMarket failed'); }
+    }
+
+    // Record signal
+    let signalId: string | null = null;
+    try {
+      signalId = await recordSignal({
+        strategy:            this.name,
+        market_id:           m.marketDbId,
+        mode:                getConfig().TRADING_MODE,
+        reason:              'pinnacle-clv-divergence',
+        side:                side === 'yes' ? 'YES' : 'NO',
+        model_prob:          noVigProb,
+        market_prob:         marketMid,
+        edge_bps:            Math.round(divergence * 10000),
+        recommended_size_usd: check.sizeUsd,
+        acted:               true,
+        payload: {
+          ticker: m.ticker, series: m.series, yesBid: m.yesBid, yesAsk: m.yesAsk,
+          noVigProb, divergence, marketMid,
+        },
+      });
+    } catch (e: any) { log.warn({ err: e.message }, 'recordSignal failed'); }
+
+    log.info({
+      ticker: m.ticker, side, entryPrice, sizeContracts,
+      noVigProb: noVigProb.toFixed(3), marketMid: marketMid.toFixed(3),
+      divergence: divergence.toFixed(3),
+    }, 'Placing sports CLV order');
+
+    try {
+      const result = await this.kalshi.placeOrder({
+        platform:    'kalshi',
+        externalId:  m.ticker,
+        outcome:     side === 'yes' ? 'YES' : 'NO',
+        side:        'BUY',
+        orderType:   'limit',
+        price:       entryPrice,
+        size:        sizeContracts,
+        // H-11: tag sports CLV orders so LIP's reconciler can never mistake them
+        // for lip-orphans (it filters on `lip-` strict prefix already; this is
+        // defense-in-depth and also makes audit logs clearer).
+        clientOrderIdPrefix: 'sports',
+      } as any);
+
+      const filled = result.filled ?? 0;
+      risk.recordOrderAttempt(m.eventTicker, result.ok && filled > 0);
+
+      // 2026-05-23 v2 BUG FIX: stamp the event as fired (per-event dedup)
+      // BEFORE checking fill status — even POSTED-but-unfilled maker orders should
+      // block the sibling ticker so we don't accidentally post on both sides.
+      if (result.ok) {
+        this.firedEventTickers.set(m.eventTicker, Date.now());
+      }
+
+      if (result.ok && result.externalOrderId) {
+        this.openOrders.set(result.externalOrderId, {
+          ticker:        m.ticker,
+          gameStartMs:   m.gameStartMs,
+          side,
+          eventTicker:   m.eventTicker,
+          limitPrice:    entryPrice,
+          sizeContracts,
+          postedAtMs:    Date.now(),
+          chaseCount:    0,
+          marketDbId:    m.marketDbId,
+        });
+      }
+
+      if (m.marketDbId) {
+        try {
+          await recordOrder({
+            signal_id:       signalId ?? undefined,
+            market_id:       m.marketDbId,
+            strategy:        this.name,
+            mode:            getConfig().TRADING_MODE,
+            side:            'BUY',
+            order_type:      'LIMIT',
+            price:           entryPrice,
+            size:            sizeContracts,
+            filled_size:     filled,
+            outcome:         side === 'yes' ? 'YES' : 'NO',
+            external_order_id: result.externalOrderId,
+            status:          !result.ok ? 'rejected'
+                           : filled >= sizeContracts ? 'filled'
+                           : filled > 0 ? 'partial'
+                           : 'open',
+          });
+        } catch (e: any) { log.warn({ err: e.message }, 'recordOrder failed'); }
+      }
+
+      if (result.ok && filled > 0) {
+        this.fires++;
+        risk.recordDeployment(this.name, m.ticker, filled * entryPrice);
+      }
+
+      try {
+        const label = result.ok && filled > 0 ? 'FILLED' : result.ok ? 'POSTED' : 'REJECTED';
+        await sendDiscord(
+          `🏆 ${label} — Sports CLV (${m.series})`,
+          `${getConfig().TRADING_MODE.toUpperCase()} · ${m.title}`,
+          result.ok ? 'info' : 'warn',
+          [
+            { name: 'Side',       value: side.toUpperCase(),              inline: true },
+            { name: 'Pinnacle',   value: noVigProb.toFixed(3),           inline: true },
+            { name: 'Market',     value: marketMid.toFixed(3),           inline: true },
+            { name: 'Edge',       value: `${(divergence*100).toFixed(1)}pp`, inline: true },
+            { name: 'Price',      value: `$${entryPrice.toFixed(3)}`,    inline: true },
+            { name: 'Size',       value: `${sizeContracts} contracts`,   inline: true },
+            ...(result.ok
+              ? [{ name: 'Filled', value: `${filled}/${sizeContracts}`, inline: false }]
+              : [{ name: 'Error',  value: result.error ?? 'unknown',    inline: false }]
+            ),
+          ]
+        );
+      } catch (e: any) { log.warn({ err: e.message }, 'Discord ping failed'); }
+    } catch (err: any) {
+      log.error({ err: err.message, ticker: m.ticker }, 'placeOrder error');
+    }
+  }
+
+  // ─── Pre-game cancel ──────────────────────────────────────────────────────────
+
+  /**
+   * v3.2 Maker chase: re-post unfilled limit orders at the new market mid
+   * when divergence still exists. Runs every 60s.
+   *
+   * Rationale (from kalshi_crypto_model_v2.pplx.md §10.1):
+   *   "A limit order strategy only generates positive EV if orders actually
+   *    execute. In a fast-moving market, your limit bid will sit unexecuted
+   *    while the market moves away. You may find that only 30–50% of maker
+   *    orders fill — and the unfilled ones are precisely the high-conviction
+   *    trades where the market validated your signal by moving rapidly."
+   *
+   * Chase rules:
+   *   - Wait at least STALE_THRESHOLD_MS (60s) before chasing
+   *   - Cap chases at MAX_CHASES (3) per order to prevent infinite reposting
+   *   - Only chase if Pinnacle still says edge exists at the new market mid
+   *   - Skip if within 10 min of game start (book getting thin)
+   *   - Maker only — never market-buy. Taker fees eat the edge.
+   */
+  private async chaseStaleMakerOrders(): Promise<void> {
+    if (!this.enabled) return;
+    const now = Date.now();
+    const STALE_THRESHOLD_MS = 60 * 1000;
+    const MAX_CHASES = 3;
+    const MIN_TIME_TO_GAME_MS = 10 * 60 * 1000;  // stop chasing within 10 min of game
+
+    for (const [orderId, info] of [...this.openOrders.entries()]) {
+      if (now - info.postedAtMs < STALE_THRESHOLD_MS) continue;
+      if (info.chaseCount >= MAX_CHASES) continue;
+      if (info.gameStartMs - now < MIN_TIME_TO_GAME_MS) continue;
+
+      const m = this.markets.get(info.ticker);
+      if (!m || m.yesBid == null || m.yesAsk == null) continue;
+
+      // Recompute current divergence with fresh Pinnacle data
+      const match = this.matchMarketToGame(m);
+      if (!match) continue;
+      const noVigProb = match.prob;
+      const marketMid = (m.yesBid + m.yesAsk) / 2;
+      // For NO bets, our "prob" is 1 - noVigProb; market price is the NO side
+      const ourSideMarketPrice = info.side === 'yes' ? m.yesBid : (m.noBid ?? (m.yesAsk != null ? 1 - m.yesAsk : 0));
+      const ourSideModelProb = info.side === 'yes' ? noVigProb : (1 - noVigProb);
+      const currentEdge = ourSideModelProb - ourSideMarketPrice;
+
+      // Need: edge still exceeds MIN_DIV, current best bid moved AWAY from our limit
+      if (currentEdge < MIN_DIV) {
+        // Edge gone — just cancel
+        log.info({ orderId, ticker: info.ticker, currentEdge: currentEdge.toFixed(3) }, 'chase: edge gone, cancelling');
+        try {
+          await this.kalshi.cancelOrder(orderId);
+          this.openOrders.delete(orderId);
+        } catch {}
+        continue;
+      }
+
+      // Check if market moved away from our limit (we'd need to bid higher to fill)
+      if (ourSideMarketPrice <= info.limitPrice + 0.005) continue;  // still at/near our price, keep waiting
+
+      // v3 favorite-longshot + price-band gates apply to the chase too
+      if (ourSideMarketPrice < 0.25 || ourSideMarketPrice > 0.80) continue;
+      if (match.pinnacleAgeSec > 600) continue;
+
+      // Chase: cancel old order, post new at the current bid
+      log.info({
+        orderId,
+        ticker: info.ticker,
+        oldPrice: info.limitPrice.toFixed(3),
+        newPrice: ourSideMarketPrice.toFixed(3),
+        currentEdge: currentEdge.toFixed(3),
+        chase: info.chaseCount + 1,
+      }, 'maker chase: market moved — cancelling + reposting at new bid');
+
+      try {
+        await this.kalshi.cancelOrder(orderId);
+        this.openOrders.delete(orderId);
+      } catch (e: any) {
+        log.warn({ err: e.message, orderId }, 'chase: cancel failed, skipping');
+        continue;
+      }
+
+      // Post new maker order at current bid
+      try {
+        const newResult = await this.kalshi.placeOrder({
+          platform:    'kalshi',
+          externalId:  info.ticker,
+          outcome:     info.side === 'yes' ? 'YES' : 'NO',
+          side:        'BUY',
+          orderType:   'limit',
+          price:       ourSideMarketPrice,
+          size:        info.sizeContracts,
+          clientOrderIdPrefix: 'sports-chase',
+        } as any);
+        if (newResult.ok && newResult.externalOrderId) {
+          this.openOrders.set(newResult.externalOrderId, {
+            ticker:        info.ticker,
+            gameStartMs:   info.gameStartMs,
+            side:          info.side,
+            eventTicker:   info.eventTicker,
+            limitPrice:    ourSideMarketPrice,
+            sizeContracts: info.sizeContracts,
+            postedAtMs:    Date.now(),
+            chaseCount:    info.chaseCount + 1,
+            marketDbId:    info.marketDbId,
+          });
+          // refresh dedup so we don't double-fire
+          this.firedEventTickers.set(info.eventTicker, Date.now());
+          const filledCount = newResult.filled ?? 0;
+          log.info({ newOrderId: newResult.externalOrderId, price: ourSideMarketPrice.toFixed(3), filled: filledCount }, 'chase: reposted');
+
+          // v3.2: Discord ping on every chase repost (user requested visibility)
+          try {
+            const chaseLabel = filledCount > 0 ? 'CHASE-FILLED' : 'CHASE-REPOSTED';
+            const pctMove = ((ourSideMarketPrice - info.limitPrice) / Math.max(0.01, info.limitPrice) * 100).toFixed(1);
+            await sendDiscord(
+              `🎯 ${chaseLabel} — Sports CLV (${m.eventTicker})`,
+              `${getConfig().TRADING_MODE.toUpperCase()} · ${m.title ?? info.ticker} · chase #${info.chaseCount + 1}/3`,
+              filledCount > 0 ? 'info' : 'info',
+              [
+                { name: 'Side',        value: info.side.toUpperCase(),                              inline: true },
+                { name: 'Old price',   value: `$${info.limitPrice.toFixed(3)}`,                     inline: true },
+                { name: 'New price',   value: `$${ourSideMarketPrice.toFixed(3)} (${pctMove}% move)`, inline: true },
+                { name: 'Pinnacle',    value: noVigProb.toFixed(3),                                 inline: true },
+                { name: 'Edge',        value: `${(currentEdge * 100).toFixed(1)}pp`,                inline: true },
+                { name: 'Size',        value: `${info.sizeContracts} contracts`,                    inline: true },
+                { name: 'Filled',      value: `${filledCount}/${info.sizeContracts}${filledCount === 0 ? ' (resting)' : ''}`, inline: false },
+              ]
+            );
+          } catch (e: any) {
+            log.warn({ err: e.message }, 'chase Discord ping failed');
+          }
+        }
+      } catch (e: any) {
+        log.warn({ err: e.message }, 'chase: repost failed');
+      }
+    }
+  }
+
+  /**
+   * Cancel all open orders 30 min before game start.
+   * Runs every 5 min. Avoids in-game adverse selection against HFT.
+   */
+  private async cancelPreGame(): Promise<void> {
+    if (!this.enabled) return;
+    const now = Date.now();
+
+    for (const [orderId, o] of this.openOrders.entries()) {
+      if (o.gameStartMs - now > CANCEL_BEFORE_MS) continue;
+
+      log.info({ orderId, ticker: o.ticker, gameStartMs: o.gameStartMs },
+        'Pre-game cancel: removing order 30 min before game');
+      try {
+        await this.kalshi.cancelOrder(orderId);
+        this.openOrders.delete(orderId);
+        // v2 M-5 fix: mark DB row as canceled too. Otherwise the orders table accumulates
+        // perpetually-open rows for pre-game cancels, polluting audit + reconcile queries.
+        try {
+          const dbRow = await findOrderByExternalId(orderId);
+          if (dbRow?.id) await updateOrder(dbRow.id, { status: 'canceled' });
+        } catch (e: any) { log.debug({ err: e.message, orderId }, 'pre-game DB updateOrder failed'); }
+        await sendDiscord(
+          'Pre-game cancel — sports CLV order removed',
+          `Cancelled ${o.ticker} ${o.side.toUpperCase()} to avoid in-game adverse selection`,
+          'info',
+          [{ name: 'OrderId', value: orderId, inline: false }]
+        );
+      } catch (e: any) {
+        log.warn({ err: e.message, orderId }, 'pre-game cancel failed');
+      }
+    }
+  }
+
+  // ─── Heartbeat ────────────────────────────────────────────────────────────────
+
+  private heartbeat(): void {
+    const sportCounts: Record<string, number> = {};
+    for (const m of this.markets.values()) {
+      sportCounts[m.series] = (sportCounts[m.series] ?? 0) + 1;
+    }
+
+    const pinnacleGames: Record<string, number> = {};
+    for (const [sportKey, cache] of this.oddsCache.entries()) {
+      pinnacleGames[sportKey] = cache.games.length;
+    }
+
+    void recordHeartbeat(this.name, getConfig().TRADING_MODE, {
+      enabled:               this.enabled,
+      trackedKalshiEvents:   this.markets.size,
+      bySeries:              sportCounts,
+      trackedPinnacleGames:  pinnacleGames,
+      openOrders:            this.openOrders.size,
+      opportunitiesSeen:     this.opportunitiesSeen,
+      fires:                 this.fires,
+      oddsApiQuotaUsed:      this.oddsApiQuotaUsed,
+    });
+  }
+}

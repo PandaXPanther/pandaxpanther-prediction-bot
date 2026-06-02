@@ -47,7 +47,7 @@ _http_client = httpx.AsyncClient(
 async def shutdown():
     await _http_client.aclose()
 
-# Station to NOAA grid mapping (lat/lon for 'points' endpoint)
+# Station to NOAA grid mapping - EXPANDED 30 US cities
 STATIONS = {
     "KNYC": (40.7128, -74.0060, "New York"),
     "KLAX": (34.0522, -118.2437, "Los Angeles"),
@@ -59,6 +59,26 @@ STATIONS = {
     "KBOS": (42.3601, -71.0589, "Boston"),
     "KHOU": (29.7604, -95.3698, "Houston"),
     "KPHX": (33.4484, -112.0740, "Phoenix"),
+    "KDFW": (32.8998, -97.0403, "Dallas"),
+    "KPHL": (39.9526, -75.1652, "Philadelphia"),
+    "KSFO": (37.7749, -122.4194, "San Francisco"),
+    "KDCA": (38.9072, -77.0369, "Washington DC"),
+    "KMSP": (44.9778, -93.2650, "Minneapolis"),
+    "KDTW": (42.3314, -83.0458, "Detroit"),
+    "KMCO": (28.5383, -81.3792, "Orlando"),
+    "KTPA": (27.9506, -82.4572, "Tampa"),
+    "KLAS": (36.1699, -115.1398, "Las Vegas"),
+    "KAUS": (30.2672, -97.7431, "Austin"),
+    "KSAN": (32.7157, -117.1611, "San Diego"),
+    "KPDX": (45.5152, -122.6784, "Portland"),
+    "KBWI": (39.2904, -76.6122, "Baltimore"),
+    "KCLT": (35.2271, -80.8431, "Charlotte"),
+    "KBNA": (36.1627, -86.7816, "Nashville"),
+    "KSTL": (38.6270, -90.1994, "Saint Louis"),
+    "KCLE": (41.4993, -81.6944, "Cleveland"),
+    "KPIT": (40.4406, -79.9959, "Pittsburgh"),
+    "KSLC": (40.7608, -111.8910, "Salt Lake City"),
+    "KIND": (39.7684, -86.1581, "Indianapolis"),
 }
 
 # In-memory cache of recent forecasts: { (station, date): forecast_data }
@@ -250,6 +270,52 @@ async def refresh(station: str):
     _cache_ts.pop((station, "current"), None)
     grid = await fetch_nbm_forecast(station)
     return {"refreshed": station, "updated_at": datetime.utcnow().isoformat()}
+
+
+@app.get("/weather/refresh-all")
+async def refresh_all_weather():
+    """Force-refresh forecasts for every known station (bypasses cache)."""
+    _forecast_cache.clear()
+    _cache_ts.clear()
+    results = {}
+    for st in STATIONS.keys():
+        try:
+            await fetch_nbm_forecast(st)
+            results[st] = "ok"
+        except Exception as e:
+            results[st] = f"error: {str(e)[:100]}"
+    return {"refreshed": len(results), "stations": results, "updated_at": datetime.utcnow().isoformat()}
+
+
+@app.post("/macro/refresh")
+@app.get("/macro/refresh")
+async def refresh_macro():
+    """Manually force-refresh all FRED macro series (GDPNow, CPI, etc.).
+
+    Useful when a new econ release just dropped — bypasses 30min TTL.
+    """
+    _macro_cache.clear()
+    _macro_ts.clear()
+    series_pulled = []
+    for s in ["GDPNOW", "CPIAUCSL", "PCEPI", "UNRATE", "PAYEMS", "DFF"]:
+        try:
+            rows = await _fred_csv(s)
+            series_pulled.append({"series": s, "rows": len(rows), "latest": rows[-1] if rows else None})
+        except Exception as e:
+            series_pulled.append({"series": s, "error": str(e)[:200]})
+    return {
+        "refreshed_at": datetime.utcnow().isoformat(),
+        "series": series_pulled,
+    }
+
+
+@app.post("/refresh-all")
+@app.get("/refresh-all")
+async def refresh_everything():
+    """Refresh weather + macro caches in one shot."""
+    weather = await refresh_all_weather()
+    macro = await refresh_macro()
+    return {"weather": weather, "macro": macro}
 
 
 # ============================================================================

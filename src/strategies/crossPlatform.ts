@@ -397,9 +397,12 @@ export class CrossPlatformStrategy {
       const pOk = pRes.ok && (pRes.filled ?? 0) > 0;
 
       if (kOk && pOk) {
-        const profit = sizeContracts * edge;
+        // KNOWN ISSUE (audit M-1): records THEORETICAL EDGE as realized PnL.
+        // Strategy is DISABLED; re-enabling requires a settlement-time PnL hook.
+        const expectedEdge = sizeContracts * edge;
+        log.warn({ pair: pair.id, expectedEdge, note: 'audit M-1' }, 'cross_platform: recording expected edge as PnL (settlement hook missing)');
         risk.recordDeployment('cross_platform', pair.id, notional);
-        await risk.recordPnl('cross_platform', profit, pair.id);
+        await risk.recordPnl('cross_platform', expectedEdge, pair.id, notional);
         await sendDiscord(
           '💰 Cross-platform arb filled',
           pair.description,
@@ -407,7 +410,7 @@ export class CrossPlatformStrategy {
           [
             { name: 'Path', value: path, inline: true },
             { name: 'Edge', value: `${(edge * 100).toFixed(2)}%`, inline: true },
-            { name: 'Profit', value: `$${profit.toFixed(2)}`, inline: true },
+            { name: 'Profit', value: `$${expectedEdge.toFixed(2)} (expected)`, inline: true },
           ]
         );
       } else if (kOk !== pOk) {

@@ -6,14 +6,28 @@ for (const k of Object.keys(process.env)) {
   if (process.env[k] === '') delete process.env[k];
 }
 
+// Proper string→boolean: 'false'/'0'/'no' → false; 'true'/'1'/'yes' → true
+// (z.coerce.boolean treats any non-empty string as true — not what we want)
+const BoolFromString = z.union([z.boolean(), z.string()])
+  .transform((v) => {
+    if (typeof v === 'boolean') return v;
+    const s = v.trim().toLowerCase();
+    return !(s === '' || s === 'false' || s === '0' || s === 'no' || s === 'off');
+  });
+
 const ConfigSchema = z.object({
   // Mode
   TRADING_MODE: z.enum(['paper', 'live']).default('paper'),
-  PERMISSIVE_PAPER: z.coerce.boolean().default(false),
-  PING_PAPER_FILLS: z.coerce.boolean().default(false),  // Discord-ping paper fills too (verbose - testing only)
-  AGGRESSIVE: z.coerce.boolean().default(false),  // Drop signal thresholds for maximum firings
+  PERMISSIVE_PAPER: BoolFromString.default(false),
+  PING_PAPER_FILLS: BoolFromString.default(false),  // Discord-ping paper fills too (verbose - testing only)
+  AGGRESSIVE: BoolFromString.default(false),  // Drop signal thresholds for maximum firings
   DAILY_LOSS_CAP_USD: z.coerce.number().positive().default(200),
   MAX_POSITION_PER_MARKET_USD: z.coerce.number().positive().default(250),
+  MAX_POSITION_PER_EVENT_USD: z.coerce.number().positive().default(30),  // total exposure across all strikes of one event
+  MAX_DAYS_TO_RESOLUTION: z.coerce.number().positive().default(7),       // refuse contracts that resolve more than N days out
+  ALLOW_FRACTIONAL_MARKETS: BoolFromString.default(false),               // refuse fractional-trading markets until we can liquidate them
+  MIN_LIQUIDITY_USD: z.coerce.number().nonnegative().default(100),       // skip markets with < $X total bid+ask depth (exit liquidity)
+  NOWCAST_PAPER_ONLY: BoolFromString.default(true),                      // force nowcast strategy to paper mode even when bot is live
 
   // Platform mode - 'both' (original) or 'kalshi_only'
   PLATFORM_MODE: z.enum(['both', 'kalshi_only']).default('both'),
@@ -27,6 +41,7 @@ const ConfigSchema = z.object({
   ALLOC_KALSHI_SUM_TO_ONE: z.coerce.number().min(0).max(1).default(0.20),
   ALLOC_NOWCAST: z.coerce.number().min(0).max(1).default(0.20),
   ALLOC_SPORTS_LATENCY: z.coerce.number().min(0).max(1).default(0.10),
+  ALLOC_HOURLY_CRYPTO: z.coerce.number().min(0).max(1).default(0.30),
 
   // Polymarket
   POLYMARKET_PRIVATE_KEY: z.string().optional(),
@@ -60,6 +75,10 @@ const ConfigSchema = z.object({
 
   // Quant
   QUANT_SERVICE_URL: z.string().url().default('http://localhost:8000'),
+
+  // Sports CLV strategy — The Odds API (theoddsapi.com)
+  // Free tier: 500 req/month. Optional — strategy no-ops if unset.
+  ODDS_API_KEY: z.string().optional(),
 });
 
 export type Config = z.infer<typeof ConfigSchema>;
@@ -78,7 +97,18 @@ export function getConfig(): Config {
 }
 
 export function isPaperMode(): boolean {
+  // C-1 fix (May 22 PM 2026): always read live env var so runtime mutations
+  // by dripEngine/forceKill (process.env.TRADING_MODE = 'paper') take effect
+  // immediately. The cached config is otherwise correct for static fields.
+  if (process.env.TRADING_MODE === 'paper') return true;
   return getConfig().TRADING_MODE === 'paper';
+}
+
+export function getTradingMode(): 'live' | 'paper' {
+  // Always reflect runtime overrides.
+  if (process.env.TRADING_MODE === 'paper') return 'paper';
+  if (process.env.TRADING_MODE === 'live') return 'live';
+  return getConfig().TRADING_MODE as 'live' | 'paper';
 }
 
 export function isKalshiOnly(): boolean {

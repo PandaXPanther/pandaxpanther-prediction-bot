@@ -7,21 +7,31 @@ primary_region = "dfw"  # Dallas - was Denver but Fly deprecated DEN region
 [env]
   NODE_ENV = "production"
   LOG_LEVEL = "info"
-  TRADING_MODE = "live"  # LIVE - real money on Kalshi
+  TRADING_MODE = "live"  # LIVE - real money on Kalshi (we paused once briefly via secrets; toml here is the deploy default)
   PERMISSIVE_PAPER = "false"
   PING_PAPER_FILLS = "false"
-  # AGGRESSIVE MODE - user-requested
-  DAILY_LOSS_CAP_USD = "100"          # 20% of $500 - kill switch at $100/day loss
-  MAX_POSITION_PER_MARKET_USD = "75"  # 15% of capital max per single market
-  AGGRESSIVE = "true"                  # drop all signal thresholds for maximum firings
+  AGGRESSIVE = "false"                 # deep research validated: stick to research-backed thresholds
+  # ====== RISK GUARDRAILS (post-incident hardening) ======
+  # Calibrated for $1300 bankroll (max ~10% daily DD, ~6% per market, ~12% per event)
+  DAILY_LOSS_CAP_USD = "50"            # 4% of bankroll - per Kalshi max-profit research May 2026 (was $194/15%; tightened after grading bug exposed loss-cap was way too permissive)
+  MAX_POSITION_PER_MARKET_USD = "104"  # 8% per market - matches new per-trade hard cap
+  MAX_POSITION_PER_EVENT_USD = "200"   # ~15% per event (still has hard 1-fire cap)
+  MAX_DAYS_TO_RESOLUTION = "7"         # NEW: refuse anything resolving more than 7 days out (no more Nov-2026 trash)
+  ALLOW_FRACTIONAL_MARKETS = "false"   # NEW: skip fractional-trading markets - we can't liquidate them reliably yet
+  MIN_LIQUIDITY_USD = "50"             # max-aggressive: $100 -> $50 (accept more thin markets)
+  NOWCAST_PAPER_ONLY = "true"          # NEW: nowcast runs paper-only until model is proven (post-incident)
   PLATFORM_MODE = "kalshi_only"  # disables all Polymarket-dependent strategies
-  # Kalshi-only strategy allocations
-  ALLOC_WEATHER = "0.50"
-  ALLOC_KALSHI_SUM_TO_ONE = "0.20"
-  ALLOC_NOWCAST = "0.20"
-  ALLOC_SPORTS_LATENCY = "0.10"
-  KALSHI_HOST = "https://api.elections.kalshi.com/trade-api/v2"
+  # ====== STRATEGY ALLOCATIONS (rebalanced toward proven winners) ======
+  # Weather model is sharpest (NBM RMSE 3F); sports latency had no fake-edge issues;
+  # sum-to-one is mechanical but rare; nowcast is paper-only until proven.
+  ALLOC_WEATHER = "0.25"               # 25% - kept alive, lower threshold = more fires
+  ALLOC_SPORTS_LATENCY = "0.00"        # DISABLED - rare off-season fires
+  ALLOC_KALSHI_SUM_TO_ONE = "0.00"     # DISABLED - books over-round = no profitable trades
+  ALLOC_NOWCAST = "0.00"               # DISABLED - paper-only no real fires
+  ALLOC_HOURLY_CRYPTO = "0.75"         # 75% - main engine
+  KALSHI_HOST = "https://api.elections.kalshi.com/trade-api/v2"  # market data + WS
   KALSHI_WSS = "wss://api.elections.kalshi.com/trade-api/ws/v2"
+  KALSHI_ORDER_HOST = "https://external-api.kalshi.com/trade-api/v2"  # production order endpoint per Kalshi docs
   NOAA_FORECAST_URL = "https://api.weather.gov"
   DISCORD_NOTIFY_USER_ID = "572590897150296083"
   # Point bot at deployed quant service for nowcast + sports models
@@ -31,4 +41,31 @@ primary_region = "dfw"  # Dallas - was Denver but Fly deprecated DEN region
   size = "shared-cpu-1x"
   memory = "512mb"
 
-# Pure background worker - no HTTP service exposed publicly
+# Background worker with an internal health endpoint on port 8080.
+# The bot exposes a tiny HTTP server at /  that returns 200 if the
+# heartbeat is fresh, 503 if stale. If checks fail repeatedly, Fly
+# auto-restarts the machine.
+[[services]]
+  internal_port = 8080
+  protocol = "tcp"
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[services.tcp_checks]]
+    interval = "15s"
+    timeout = "5s"
+    grace_period = "60s"
+
+  [[services.http_checks]]
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "90s"
+    method = "get"
+    path = "/"
+
+# When the process exits (e.g. our watchdog forces process.exit(1)),
+# Fly restarts the machine automatically. This is the default but we
+# state it explicitly.
+[[restart]]
+  policy = "always"

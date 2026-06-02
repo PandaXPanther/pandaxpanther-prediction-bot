@@ -95,7 +95,7 @@ export class SumToOneStrategy {
     }, 60_000);
 
     // Hourly "liveness" Discord ping with the tightest spread we saw this hour
-    setInterval(() => this.sendActivityPing(), 15 * 60 * 1000)  // 15 min for permissive paper visibility;
+    // Activity pings disabled - too noisy. Use dashboard for status.
   }
 
   /**
@@ -314,9 +314,14 @@ export class SumToOneStrategy {
       const noFilled = noResult.ok && (noResult.filled ?? 0) > 0;
 
       if (yesFilled && noFilled) {
-        const profit = sizeToTrade * netEdge;
+        // KNOWN ISSUE (audit M-1): this records THEORETICAL EDGE (size * netEdge)
+        // as realized PnL at fill time — not the actual realized PnL at settlement.
+        // This strategy is currently DISABLED; if you re-enable it, replace this
+        // with a proper on-settlement PnL hook or accounting will drift.
+        const expectedEdge = sizeToTrade * netEdge;
+        log.warn({ pair: pair.conditionId, expectedEdge, note: 'audit M-1' }, 'sum_to_one: recording expected edge as PnL (settlement hook missing)');
         risk.recordDeployment('sum_to_one', pair.conditionId, notional);
-        await risk.recordPnl('sum_to_one', profit, pair.conditionId);
+        await risk.recordPnl('sum_to_one', expectedEdge, pair.conditionId, notional);
         await sendDiscord(
           '💰 Sum-to-one arb filled',
           pair.question,
@@ -325,7 +330,7 @@ export class SumToOneStrategy {
             { name: 'YES ask', value: yesAsk.toFixed(4), inline: true },
             { name: 'NO ask', value: noAsk.toFixed(4), inline: true },
             { name: 'Size', value: sizeToTrade.toFixed(2), inline: true },
-            { name: 'Profit', value: `$${profit.toFixed(2)}`, inline: true },
+            { name: 'Profit', value: `$${expectedEdge.toFixed(2)} (expected)`, inline: true },
           ]
         );
       } else if (yesFilled !== noFilled) {

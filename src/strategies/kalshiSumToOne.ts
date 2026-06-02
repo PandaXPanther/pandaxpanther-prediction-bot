@@ -33,8 +33,8 @@ const log = createStrategyLogger('kalshi_sum_to_one');
 
 const TRIGGER_SUM_PROD = 0.97;           // 3% gross edge minimum
 const MIN_EDGE_PROD = 0.015;             // 1.5% net minimum
-const TRIGGER_SUM_PERMISSIVE = 0.995;    // 0.5% gross edge
-const MIN_EDGE_PERMISSIVE = 0.002;       // 0.2% net edge
+const TRIGGER_SUM_PERMISSIVE = 0.995;    // 0.5% gross edge (max-aggressive)
+const MIN_EDGE_PERMISSIVE = 0.0015;      // half-send: 0.2% -> 0.15% net edge
 
 // Aggressive = same as permissive (drop thresholds way down)
 const getTriggerSum = () => (isPermissive() || isAggressive() ? TRIGGER_SUM_PERMISSIVE : TRIGGER_SUM_PROD);
@@ -43,6 +43,10 @@ const getMinEdge = () => (isPermissive() || isAggressive() ? MIN_EDGE_PERMISSIVE
 interface KalshiMarketSnapshot {
   ticker: string;
   title: string;
+  closesAt?: Date;
+  eventTicker?: string;
+  fractional?: boolean;
+  liquidityUsd?: number;
   yesAsk: number | null;  // dollars
   noAsk: number | null;
   yesAskQty: number;
@@ -85,7 +89,7 @@ export class KalshiSumToOneStrategy {
     }, 60_000);
 
     // Hourly Discord activity ping
-    setInterval(() => this.sendActivityPing(), 15 * 60 * 1000)  // 15 min for permissive paper visibility;
+    // Activity pings disabled - too noisy. Use dashboard for status.
   }
 
   /**
@@ -149,6 +153,10 @@ export class KalshiSumToOneStrategy {
               snap = {
                 ticker: m.ticker,
                 title: m.title ?? m.subtitle ?? m.ticker,
+                closesAt: m.close_time ? new Date(m.close_time) : undefined,
+                eventTicker: m.event_ticker,
+                fractional: m.fractional_trading_enabled === true,
+                liquidityUsd: m.liquidity_dollars ? parseFloat(m.liquidity_dollars) : (m.liquidity != null ? m.liquidity / 100 : undefined),
                 yesAsk, noAsk,
                 yesAskQty: book.yesAskQty ?? 0,
                 noAskQty: book.noAskQty ?? 0,
@@ -224,7 +232,12 @@ export class KalshiSumToOneStrategy {
 
     // Sized & actionable - check risk & fire
     const risk = getRiskEngine();
-    const check = risk.canTrade('kalshi_sum_to_one', snap.ticker, recommended);
+    const check = risk.canTrade('kalshi_sum_to_one', snap.ticker, recommended, {
+      closesAt: snap.closesAt,
+      eventTicker: snap.eventTicker,
+      fractional: snap.fractional,
+      liquidityUsd: snap.liquidityUsd,
+    });
     if (!check.allowed) return;
 
     const sizeContracts = Math.floor(check.sizeUsd / Math.max(snap.yesAsk, snap.noAsk));
@@ -233,14 +246,14 @@ export class KalshiSumToOneStrategy {
     this.inFlight.add(snap.ticker);
     log.info({ ticker: snap.ticker, sum, netEdge, sizeContracts }, 'Kalshi sum-to-one opportunity');
 
-    if (shouldPingPaperFills()) {
+    if (false && shouldPingPaperFills()) {  // Disabled - too noisy
       await sendDiscord(
         '🔔 Kalshi sum-to-one opportunity',
         snap.title,
         'success',
         [
-          { name: 'YES ask', value: snap.yesAsk.toFixed(4), inline: true },
-          { name: 'NO ask', value: snap.noAsk.toFixed(4), inline: true },
+          { name: 'YES ask', value: (snap.yesAsk ?? 0).toFixed(4), inline: true },
+          { name: 'NO ask', value: (snap.noAsk ?? 0).toFixed(4), inline: true },
           { name: 'Sum', value: sum.toFixed(4), inline: true },
           { name: 'Net edge', value: `${(netEdge * 100).toFixed(2)}%`, inline: true },
           { name: 'Size', value: sizeContracts.toString(), inline: true },
@@ -284,9 +297,12 @@ export class KalshiSumToOneStrategy {
       });
 
       if ((yesRes.filled ?? 0) > 0 && (noRes.filled ?? 0) > 0) {
-        const profit = sizeContracts * netEdge;
-        risk.recordDeployment('kalshi_sum_to_one', snap.ticker, recommended);
-        await risk.recordPnl('kalshi_sum_to_one', profit, snap.ticker);
+        // KNOWN ISSUE (audit M-1): records THEORETICAL EDGE as realized PnL.
+        // Strategy is DISABLED; re-enabling requires a settlement-time PnL hook.
+        const expectedEdge = sizeContracts * netEdge;
+        log.warn({ ticker: snap.ticker, expectedEdge, note: 'audit M-1' }, 'kalshi_sum_to_one: recording expected edge as PnL (settlement hook missing)');
+        risk.recordDeployment('kalshi_sum_to_one', snap.ticker, recommended, snap.eventTicker);
+        await risk.recordPnl('kalshi_sum_to_one', expectedEdge, snap.ticker, recommended);
         await sendDiscord(
           '💰 Kalshi sum-to-one filled',
           snap.title,
@@ -295,7 +311,7 @@ export class KalshiSumToOneStrategy {
             { name: 'YES ask', value: snap.yesAsk.toFixed(4), inline: true },
             { name: 'NO ask', value: snap.noAsk.toFixed(4), inline: true },
             { name: 'Size', value: sizeContracts.toString(), inline: true },
-            { name: 'Profit', value: `$${profit.toFixed(2)}`, inline: true },
+            { name: 'Profit', value: `$${expectedEdge.toFixed(2)} (expected)`, inline: true },
           ]
         );
       }

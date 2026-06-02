@@ -28,6 +28,10 @@ export interface PlaceOrderRequest {
   orderType: OrderType;
   price: number;
   size: number;
+  /** Optional client_order_id prefix for strategy identification (e.g., 'lip', 'crypto-tp'). Default 'bot'. */
+  clientOrderIdPrefix?: string;
+  /** If false, allow taker fills. Default true for BUYs (post-only — reject if would cross). */
+  postOnly?: boolean;
 }
 
 export interface PlaceOrderResult {
@@ -44,6 +48,9 @@ export interface MarketInfo {
   question: string;
   category?: string;
   closesAt?: Date;
+  eventTicker?: string;
+  fractional?: boolean;
+  liquidityUsd?: number;       // total bid+ask depth in dollars
   yes_token?: string;          // for Polymarket two-token markets
   no_token?: string;
 }
