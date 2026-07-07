@@ -1,19 +1,48 @@
-# 🐼 PandaXPanther Prediction Bot
+<div align="center">
 
-Fully autonomous prediction market trading bot for **Polymarket** + **Kalshi**.
+# Prediction Market Trading Bot
 
-Four independent strategies running concurrently, all in **paper mode by default** until you (a) have real accounts, (b) have validated profitability for at least 2 weeks of paper trading.
+**An autonomous multi-strategy trading system across Polymarket and Kalshi — latency arbitrage, cross-venue pricing, sum-to-one structural edges, and a NOAA-ensemble weather model.**
+
+[![TypeScript](https://img.shields.io/badge/TypeScript-5-3178C6?style=for-the-badge&logo=typescript&logoColor=white)](https://typescriptlang.org)
+[![Node](https://img.shields.io/badge/Node-20+-339933?style=for-the-badge&logo=node.js&logoColor=white)](https://nodejs.org)
+[![Polymarket](https://img.shields.io/badge/Polymarket-CLOB-6F2DD4?style=for-the-badge)](https://polymarket.com)
+[![Kalshi](https://img.shields.io/badge/Kalshi-CFTC-1B998B?style=for-the-badge)](https://kalshi.com)
+[![Supabase](https://img.shields.io/badge/Supabase-Postgres-3FCF8E?style=for-the-badge&logo=supabase&logoColor=white)](https://supabase.com)
+[![License](https://img.shields.io/badge/License-Source--Available-red?style=for-the-badge)](#license)
+
+</div>
+
+---
+
+## About
+
+This is an autonomous prediction-market trading bot that runs four independent strategies concurrently across Polymarket (CLOB on Polygon) and Kalshi (CFTC-regulated). It streams live order books from both venues plus Binance and Coinbase, prices opportunities in real time, routes every signal through a Kelly-fraction risk engine with hard caps and a daily-loss kill switch, and persists positions, fills, and PnL to Postgres.
+
+Everything runs in **paper mode by default** — real accounts, KYC, and a validated paper-trading track record are prerequisites for live execution. The bot is architected to go live without code changes; the switch is an environment variable gated behind proven paper performance.
+
+---
+
+## What this project demonstrates
+
+For reviewers evaluating quantitative, systems, and product judgment:
+
+- **Strategy design** — four distinct, theoretically-grounded edges: structural arbitrage (YES + NO mispricing below $1.00), cross-venue price discovery between two regulated prediction markets, crypto latency arbitrage (Polymarket lagging centralized exchanges by 2–5s), and a meteorological model (NOAA NBM ensemble vs. retail-traded weather contracts).
+- **Real-time engineering** — a Node/TypeScript orchestrator multiplexing four WebSocket streams (Binance, Coinbase, Polymarket, Kalshi) through a price-feed aggregator into concurrent strategy engines, with a Python FastAPI quant sidecar for the weather model.
+- **Risk management** — a Kelly-fraction sizing engine (25% of full Kelly, hard 5%-of-bankroll ceiling), per-strategy capital allocation, per-market position caps, and an automatic daily-loss kill switch that halts all trading until midnight UTC.
+- **Full-stack ownership** — Supabase Postgres schema for markets, orders, positions, and daily PnL; Zod-validated configuration; structured Pino logging; Discord alerting; Dockerized services deployed on Fly.io.
+- **Scientific discipline** — paper-first validation, per-strategy PnL/slippage/calibration queries, and an explicit checklist a strategy must pass (signals firing, fees modeled, calibration within band, kill switch verified) before any live capital is committed.
 
 ---
 
 ## Strategies
 
-| Strategy | Platforms | Edge Source | Capital | Build Status |
-|---|---|---|---|---|
-| **sum_to_one** | Polymarket | Best-ask(YES) + best-ask(NO) < $1.00 = arb | $1,000 (25%) | ✅ |
-| **cross_platform** | Kalshi ↔ Polymarket | Same event, different price discovery | $1,500 (30%) | ✅ (needs pair registry) |
-| **crypto_latency** | Polymarket | Polymarket lags Binance/Coinbase by 2-5s | $1,500 (30%) | ✅ |
-| **weather** | Kalshi | NOAA NBM ensemble vs retail-traded contracts | $750 (15%) | ✅ |
+| Strategy | Platforms | Edge source | Capital |
+|---|---|---|---|
+| **sum_to_one** | Polymarket | best-ask(YES) + best-ask(NO) < $1.00 = structural arb | 25% |
+| **cross_platform** | Kalshi ↔ Polymarket | same event, different price discovery | 30% |
+| **crypto_latency** | Polymarket | Polymarket lags Binance/Coinbase by 2–5s | 30% |
+| **weather** | Kalshi | NOAA NBM ensemble vs. retail-traded contracts | 15% |
 
 Allocations are configurable via `.env`.
 
@@ -41,7 +70,7 @@ Allocations are configurable via `.env`.
                     │                  ↓                    │
                     │   ┌─────────────────────────────┐    │    ┌────────────┐
                     │   │  Risk Engine                │────┼───→│ Discord    │
-                    │   │  (Kelly · loss caps · kill) │    │    │ alerts     │
+                    │   │  (Kelly · loss caps · kill)  │    │    │ alerts     │
                     │   └──────────────┬──────────────┘    │    └────────────┘
                     │                  ↓                    │
                     └─────────────┬────────────────────────┘
@@ -56,124 +85,7 @@ Allocations are configurable via `.env`.
 
 ---
 
-## Quick Start (Paper Mode)
-
-You can run paper trading WITHOUT any accounts. Set up Supabase + Discord first (both free).
-
-### 1. Clone & install
-
-```bash
-git clone git@github.com:PandaXPanther/pandaxpanther-prediction-bot.git
-cd pandaxpanther-prediction-bot
-npm install
-```
-
-### 2. Set up Supabase
-
-1. Create a new project at [supabase.com](https://supabase.com) (free tier)
-2. Go to SQL Editor → paste contents of `supabase/migrations/0001_initial_schema.sql` → run
-3. Copy the project URL and the **service_role** key
-4. `cp .env.example .env` and fill in `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY`
-
-### 3. Set up Discord webhook (optional but recommended)
-
-In any Discord server: Server Settings → Integrations → Webhooks → New Webhook. Copy URL into `DISCORD_WEBHOOK_URL`.
-
-### 4. Run
-
-```bash
-# Just one strategy at a time
-npm run strategy:sum-to-one
-
-# Or all four
-npm run dev
-```
-
-Bot will connect to Polymarket + Kalshi via WebSocket, stream order books, and log paper "fills" to console + Supabase. Real money is NEVER at risk in paper mode.
-
-### 5. Start the Python quant service (required for weather strategy)
-
-```bash
-cd services/quant
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-uvicorn main:app --reload --port 8000
-```
-
-Test it:
-
-```bash
-curl 'http://localhost:8000/weather/prob?station=KDEN&metric=high_temp_f&threshold=85&direction=above'
-```
-
----
-
-## Going Live (When Ready)
-
-### Polymarket account setup
-
-1. **Parent creates account** at [polymarket.com](https://polymarket.com) - requires KYC, 18+
-2. Deposit USDC (USDC.e on Polygon) - bridge from Coinbase via Polymarket's onramp
-3. In the Polymarket UI: Profile → API Keys → Create (sign with wallet)
-4. You'll receive:
-   - `api_key`, `secret`, `passphrase` → store in `.env`
-   - The funder address (your proxy wallet) → store in `.env`
-   - Export the wallet private key (Settings → Export) → store in `.env`
-5. **Approve the CTF Exchange contract** to spend USDC (one-time, done via the UI)
-
-### Kalshi account setup
-
-1. **Parent creates account** at [kalshi.com](https://kalshi.com) - requires KYC, 18+
-2. ACH-fund the account (instant for verified bank accounts)
-3. In Profile → API: generate an API key. You get:
-   - `api_key_id` (string) → store as `KALSHI_API_KEY_ID`
-   - Private key download (PEM file) → save to `secrets/kalshi_private_key.pem`
-4. Make sure `secrets/` is in `.gitignore` (it is by default)
-
-### Flip the switch
-
-```bash
-# Locally
-sed -i 's/TRADING_MODE=paper/TRADING_MODE=live/' .env
-
-# Or on Fly.io
-fly secrets set TRADING_MODE=live
-```
-
-**Do NOT do this until you've watched paper trading for at least 2 weeks and confirmed:**
-- Sum-to-one signals are firing and theoretically profitable
-- Crypto latency signals are firing and not getting eaten by fees
-- Weather signals match real outcomes within calibration band
-- The risk engine kill switch works (intentionally inject a loss and verify it kicks in)
-
----
-
-## Deploy to Fly.io
-
-```bash
-# Install flyctl, sign in
-brew install flyctl
-fly auth login
-
-# Deploy main bot
-fly launch  # creates pandaxpanther-prediction-bot app
-fly secrets set $(cat .env | xargs)  # bulk push env vars
-fly deploy
-
-# Deploy quant service
-cd services/quant
-fly launch  # creates pandaxpanther-quant app
-fly deploy
-
-# Then back in root .env / fly secrets: set QUANT_SERVICE_URL=https://pandaxpanther-quant.fly.dev
-fly secrets set QUANT_SERVICE_URL=https://pandaxpanther-quant.fly.dev -a pandaxpanther-prediction-bot
-```
-
-Cost: ~$5–8/month for both machines on Fly's shared-cpu tier.
-
----
-
-## Project Structure
+## Project structure
 
 ```
 src/
@@ -214,9 +126,9 @@ scripts/
 
 ---
 
-## Risk Controls (Read This)
+## Risk controls
 
-The risk engine enforces hard limits BEFORE any order is sent:
+The risk engine enforces hard limits **before** any order is sent:
 
 | Control | Default | Where to change |
 |---|---|---|
@@ -226,53 +138,86 @@ The risk engine enforces hard limits BEFORE any order is sent:
 | Kelly fraction | 25% of full Kelly | hardcoded in `riskEngine.ts` |
 | Hard position cap | 5% of bankroll | hardcoded ceiling on Kelly |
 
-**If daily PnL hits -$200, the kill switch fires and ALL trading stops until midnight UTC.** Discord alert sent immediately.
+If daily PnL hits -$200, the kill switch fires and **all trading stops until midnight UTC**. A Discord alert is sent immediately.
 
 ---
 
-## What to Watch in Paper Mode
+## Quick start (paper mode)
 
-After 1 week of paper trading, query Supabase to evaluate each strategy:
+Paper trading runs without any exchange accounts — only Supabase and Discord (both free).
 
-```sql
--- Per-strategy paper PnL
-SELECT strategy, sum(realized_pnl) as pnl, sum(num_trades) as trades
-FROM pnl_daily WHERE mode = 'paper' GROUP BY strategy;
+```bash
+git clone https://github.com/PandaXPanther/pandaxpanther-prediction-bot.git
+cd pandaxpanther-prediction-bot
+npm install
 
--- Which markets are firing the most signals?
-SELECT m.question, count(*) FROM signals s
-JOIN markets m ON m.id = s.market_id
-WHERE s.ts > now() - interval '7 days'
-GROUP BY m.question ORDER BY count(*) DESC LIMIT 20;
+# 1. Create a Supabase project, run supabase/migrations/0001_initial_schema.sql
+# 2. cp .env.example .env and fill in SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY
+# 3. (optional) add a Discord webhook to DISCORD_WEBHOOK_URL
 
--- Slippage analysis (paper fills vs theoretical)
-SELECT strategy, avg(filled_size / size) as fill_rate, avg(avg_fill_price - price) as slippage
-FROM orders WHERE mode = 'paper' AND status IN ('filled', 'partial')
-GROUP BY strategy;
+# Run one strategy:
+npm run strategy:sum-to-one
+
+# Or all four:
+npm run dev
 ```
 
-If a strategy is losing money in paper, **figure out why before going live**. Common causes:
-- Threshold too loose (firing on noise)
-- Fees not properly modeled
-- Stale book data triggering false signals
+Start the Python quant service (required for the weather strategy):
+
+```bash
+cd services/quant
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+uvicorn main:app --reload --port 8000
+
+# Sanity check:
+curl 'http://localhost:8000/weather/prob?station=KDEN&metric=high_temp_f&threshold=85&direction=above'
+```
 
 ---
 
-## Roadmap (V2+)
+## Going live
 
-- [ ] LLM-powered market matcher for cross_platform pairs (auto-discover)
+Live mode requires KYC'd Polymarket and Kalshi accounts, funded balances, approved exchange contracts, and — critically — a paper-trading track record of at least two weeks confirming: sum-to-one signals are firing and theoretically profitable, crypto-latency signals survive fees, weather signals match real outcomes within a calibration band, and the risk-engine kill switch works (verified by intentionally injecting a loss).
+
+The switch itself is a single environment variable (`TRADING_MODE=live`), by design — the goal is that no code changes between paper and live, only configuration and conviction.
+
+---
+
+## Roadmap
+
+- [ ] LLM-powered market matcher for cross-platform pairs (auto-discovery)
 - [ ] HGEFS ensemble integration for weather (full distribution, not Gaussian approx)
-- [ ] Box office / earnings models in the quant service
-- [ ] Maker-mode order book provider on Polymarket (USDC rebates)
+- [ ] Box-office / earnings models in the quant service
+- [ ] Maker-mode order-book provider on Polymarket (USDC rebates)
 - [ ] CEX-perp delta hedging for crypto contracts > 1 day duration
 - [ ] Web dashboard (Next.js on Netlify) for live PnL monitoring
 
 ---
 
-## License
+## Stack
 
-Private — do not redistribute.
+| Layer | Choice |
+|-------|--------|
+| Bot runtime | Node `20+` / TypeScript `5` |
+| Bot hosting | Fly.io (Denver region) |
+| Quant service | Python / FastAPI / scipy |
+| Database | Supabase Postgres |
+| Venues | Polymarket CLOB, Kalshi REST+WS |
+| Price feeds | Binance WS, Coinbase WS |
+| Weather data | NOAA NBM / api.weather.gov |
+| Config validation | Zod |
+| Logging | Pino |
+| Alerts | Discord webhooks |
 
 ---
 
-Built by Computer for [@PandaXPanther](https://github.com/PandaXPanther). Designed to slot into the same Fly.io + Supabase stack as your CSFloat sniper.
+## Disclaimer
+
+This is research / educational infrastructure. Prediction-market contracts can lose their full value. Nothing here is financial advice. Do not deploy real capital based on paper results alone.
+
+---
+
+## License
+
+This project is **source-available for portfolio and educational review only** — it is not open source. No rights are granted to copy, redistribute, deploy, run, or commercially exploit this software. The operational configuration, tuned strategy parameters, and infrastructure credentials that make the system run are intentionally not included in this repository, so the code as published will not run as-is. See [`LICENSE`](LICENSE) for the full terms.
