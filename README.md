@@ -2,7 +2,7 @@
 
 # Prediction Market Trading Bot
 
-**An autonomous multi-strategy trading system across Polymarket and Kalshi — latency arbitrage, cross-venue pricing, sum-to-one structural edges, and a NOAA-ensemble weather model.**
+**A bot that trades prediction markets on Polymarket and Kalshi using four different strategies at once. Latency arbitrage, cross-venue pricing, structural edges, and a weather model built off NOAA data.**
 
 [![TypeScript](https://img.shields.io/badge/TypeScript-5-3178C6?style=for-the-badge&logo=typescript&logoColor=white)](https://typescriptlang.org)
 [![Node](https://img.shields.io/badge/Node-20+-339933?style=for-the-badge&logo=node.js&logoColor=white)](https://nodejs.org)
@@ -15,23 +15,23 @@
 
 ---
 
-## About
+## What it is
 
-This is an autonomous prediction-market trading bot that runs four independent strategies concurrently across Polymarket (CLOB on Polygon) and Kalshi (CFTC-regulated). It streams live order books from both venues plus Binance and Coinbase, prices opportunities in real time, routes every signal through a Kelly-fraction risk engine with hard caps and a daily-loss kill switch, and persists positions, fills, and PnL to Postgres.
+This is a bot I built that trades prediction markets on Polymarket and Kalshi. It runs four strategies at the same time: structural arbitrage (when the YES and NO prices on Polymarket add up to less than $1), cross-venue arbitrage (same event priced differently on Kalshi vs Polymarket), crypto latency arbitrage (Polymarket lags Binance and Coinbase by 2 to 5 seconds, so you can front-run the move), and a weather model that prices Kalshi weather contracts against NOAA NBM ensemble data.
 
-Everything runs in **paper mode by default** — real accounts, KYC, and a validated paper-trading track record are prerequisites for live execution. The bot is architected to go live without code changes; the switch is an environment variable gated behind proven paper performance.
+It streams live order books from both venues plus Binance and Coinbase, prices opportunities in real time, routes every signal through a risk engine that uses Kelly fraction sizing with hard caps and a daily loss kill switch, and saves positions, fills, and PnL to Postgres.
+
+Everything runs in paper mode by default. You need real KYC'd accounts and a validated paper track record before going live, and even then the switch is just an environment variable. The whole point is that going live doesn't require code changes, just configuration and enough confidence in the paper results.
 
 ---
 
-## What this project demonstrates
+## What I learned building it
 
-For reviewers evaluating quantitative, systems, and product judgment:
-
-- **Strategy design** — four distinct, theoretically-grounded edges: structural arbitrage (YES + NO mispricing below $1.00), cross-venue price discovery between two regulated prediction markets, crypto latency arbitrage (Polymarket lagging centralized exchanges by 2–5s), and a meteorological model (NOAA NBM ensemble vs. retail-traded weather contracts).
-- **Real-time engineering** — a Node/TypeScript orchestrator multiplexing four WebSocket streams (Binance, Coinbase, Polymarket, Kalshi) through a price-feed aggregator into concurrent strategy engines, with a Python FastAPI quant sidecar for the weather model.
-- **Risk management** — a Kelly-fraction sizing engine (25% of full Kelly, hard 5%-of-bankroll ceiling), per-strategy capital allocation, per-market position caps, and an automatic daily-loss kill switch that halts all trading until midnight UTC.
-- **Full-stack ownership** — Supabase Postgres schema for markets, orders, positions, and daily PnL; Zod-validated configuration; structured Pino logging; Discord alerting; Dockerized services deployed on Fly.io.
-- **Scientific discipline** — paper-first validation, per-strategy PnL/slippage/calibration queries, and an explicit checklist a strategy must pass (signals firing, fees modeled, calibration within band, kill switch verified) before any live capital is committed.
+- **Strategy design.** Four different edges, each with its own logic. Sum-to-one is a structural arb that fires when best-ask(YES) plus best-ask(NO) is under $1.00. Cross-platform is the same event priced differently across two regulated prediction markets. Crypto latency is Polymarket lagging behind centralized exchanges. Weather is a NOAA NBM ensemble model priced against retail-traded Kalshi contracts.
+- **Real-time engineering.** The main bot is Node and TypeScript, multiplexing four WebSocket streams (Binance, Coinbase, Polymarket, Kalshi) through a price feed aggregator into the strategy engines. The weather model runs in a separate Python FastAPI service.
+- **Risk management.** Kelly fraction sizing at 25% of full Kelly with a hard 5%-of-bankroll ceiling, per-strategy capital allocation, per-market position caps, and an automatic daily-loss kill switch that halts all trading until midnight UTC.
+- **Full stack.** Supabase Postgres schema for markets, orders, positions, and daily PnL. Zod-validated config. Structured logging with Pino. Discord alerts. Dockerized services on Fly.io.
+- **Scientific discipline.** Paper first, always. Before any strategy goes live it has to pass a checklist: signals are firing, fees are properly modeled, weather signals match real outcomes within a calibration band, and the kill switch actually works (I verify that one by intentionally injecting a loss and watching it trip).
 
 ---
 
@@ -40,11 +40,11 @@ For reviewers evaluating quantitative, systems, and product judgment:
 | Strategy | Platforms | Edge source | Capital |
 |---|---|---|---|
 | **sum_to_one** | Polymarket | best-ask(YES) + best-ask(NO) < $1.00 = structural arb | 25% |
-| **cross_platform** | Kalshi ↔ Polymarket | same event, different price discovery | 30% |
-| **crypto_latency** | Polymarket | Polymarket lags Binance/Coinbase by 2–5s | 30% |
+| **cross_platform** | Kalshi and Polymarket | same event, different price discovery | 30% |
+| **crypto_latency** | Polymarket | Polymarket lags Binance/Coinbase by 2-5s | 30% |
 | **weather** | Kalshi | NOAA NBM ensemble vs. retail-traded contracts | 15% |
 
-Allocations are configurable via `.env`.
+Allocations are configurable in `.env`.
 
 ---
 
@@ -96,7 +96,7 @@ src/
     priceFeeds.ts        # Binance/Coinbase ticker aggregator
   strategies/
     sumToOne.ts          # Polymarket YES+NO < $1 arb
-    crossPlatform.ts     # Kalshi ↔ Polymarket arb
+    crossPlatform.ts     # Kalshi and Polymarket arb
     cryptoLatency.ts     # BTC/ETH lag arbitrage on PM
     weatherSignal.ts     # Kalshi weather quant model
   risk/
@@ -128,7 +128,7 @@ scripts/
 
 ## Risk controls
 
-The risk engine enforces hard limits **before** any order is sent:
+The risk engine enforces hard limits before any order gets sent:
 
 | Control | Default | Where to change |
 |---|---|---|
@@ -138,13 +138,13 @@ The risk engine enforces hard limits **before** any order is sent:
 | Kelly fraction | 25% of full Kelly | hardcoded in `riskEngine.ts` |
 | Hard position cap | 5% of bankroll | hardcoded ceiling on Kelly |
 
-If daily PnL hits -$200, the kill switch fires and **all trading stops until midnight UTC**. A Discord alert is sent immediately.
+If daily PnL hits -$200, the kill switch fires and all trading stops until midnight UTC. A Discord alert goes out immediately.
 
 ---
 
 ## Quick start (paper mode)
 
-Paper trading runs without any exchange accounts — only Supabase and Discord (both free).
+Paper trading runs without any exchange accounts. You just need Supabase and Discord, both free.
 
 ```bash
 git clone https://github.com/PandaXPanther/pandaxpanther-prediction-bot.git
@@ -162,7 +162,7 @@ npm run strategy:sum-to-one
 npm run dev
 ```
 
-Start the Python quant service (required for the weather strategy):
+Start the Python quant service (needed for the weather strategy):
 
 ```bash
 cd services/quant
@@ -178,9 +178,9 @@ curl 'http://localhost:8000/weather/prob?station=KDEN&metric=high_temp_f&thresho
 
 ## Going live
 
-Live mode requires KYC'd Polymarket and Kalshi accounts, funded balances, approved exchange contracts, and — critically — a paper-trading track record of at least two weeks confirming: sum-to-one signals are firing and theoretically profitable, crypto-latency signals survive fees, weather signals match real outcomes within a calibration band, and the risk-engine kill switch works (verified by intentionally injecting a loss).
+Live mode needs KYC'd Polymarket and Kalshi accounts, funded balances, approved exchange contracts, and a paper track record of at least two weeks confirming: sum-to-one signals are firing and theoretically profitable, crypto-latency signals survive fees, weather signals match real outcomes within a calibration band, and the risk-engine kill switch works (verified by injecting a loss on purpose and watching it trip).
 
-The switch itself is a single environment variable (`TRADING_MODE=live`), by design — the goal is that no code changes between paper and live, only configuration and conviction.
+The switch itself is one environment variable, `TRADING_MODE=live`. That's on purpose. The goal is that nothing changes between paper and live except config and how much you trust the results.
 
 ---
 
@@ -188,9 +188,9 @@ The switch itself is a single environment variable (`TRADING_MODE=live`), by des
 
 - [ ] LLM-powered market matcher for cross-platform pairs (auto-discovery)
 - [ ] HGEFS ensemble integration for weather (full distribution, not Gaussian approx)
-- [ ] Box-office / earnings models in the quant service
-- [ ] Maker-mode order-book provider on Polymarket (USDC rebates)
-- [ ] CEX-perp delta hedging for crypto contracts > 1 day duration
+- [ ] Box office / earnings models in the quant service
+- [ ] Maker-mode order book provider on Polymarket (USDC rebates)
+- [ ] CEX-perp delta hedging for crypto contracts longer than 1 day
 - [ ] Web dashboard (Next.js on Netlify) for live PnL monitoring
 
 ---
@@ -199,7 +199,7 @@ The switch itself is a single environment variable (`TRADING_MODE=live`), by des
 
 | Layer | Choice |
 |-------|--------|
-| Bot runtime | Node `20+` / TypeScript `5` |
+| Bot runtime | Node 20+ / TypeScript 5 |
 | Bot hosting | Fly.io (Denver region) |
 | Quant service | Python / FastAPI / scipy |
 | Database | Supabase Postgres |
@@ -214,10 +214,10 @@ The switch itself is a single environment variable (`TRADING_MODE=live`), by des
 
 ## Disclaimer
 
-This is research / educational infrastructure. Prediction-market contracts can lose their full value. Nothing here is financial advice. Do not deploy real capital based on paper results alone.
+This is research and educational infrastructure. Prediction-market contracts can lose their full value. Nothing here is financial advice. Don't deploy real capital based on paper results alone.
 
 ---
 
 ## License
 
-This project is **source-available for portfolio and educational review only** — it is not open source. No rights are granted to copy, redistribute, deploy, run, or commercially exploit this software. The operational configuration, tuned strategy parameters, and infrastructure credentials that make the system run are intentionally not included in this repository, so the code as published will not run as-is. See [`LICENSE`](LICENSE) for the full terms.
+This code is **source-available for portfolio and educational review only**, not open source. You can read it to see what I built, but you can't copy, redistribute, deploy, run, or make money off it. The config, tuned strategy parameters, and infrastructure credentials that make it actually run aren't in this repo, so the code as published won't run as-is. See [`LICENSE`](LICENSE) for the full terms.
