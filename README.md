@@ -216,6 +216,10 @@ The switch itself is one environment variable, `TRADING_MODE=live`. That's on pu
 
 This is research and educational infrastructure. Prediction-market contracts can lose their full value. Nothing here is financial advice. Don't deploy real capital based on paper results alone.
 
+## Author
+
+Built by [Saras Totey](https://sarastotey.com).
+
 ---
 
 ## License
